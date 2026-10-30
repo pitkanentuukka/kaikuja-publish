@@ -1,0 +1,998 @@
+#!/usr/bin/env python3
+"""kaikuja-publish — Kaikuja Kaikkeudesta -jakson julkaisu kaikkiin kanaviin.
+
+Lukee jakson Julkaisu.md-tiedoston (frontmatter + "## avain" -osiot) ja tekee:
+
+  prepare  — Podbean: mp3 + luonnosjakso | WordPress: luonnospostaus + artikkelikuva |
+             YouTube: hakee käsin ladatun (yksityisen) videon ja asettaa otsikon,
+             kuvauksen, tagit ja thumbnailin
+  publish  — julkaisee Podbeanin, WordPressin ja YouTuben (public) ja postaa
+             Mastodoniin, Blueskyhin, LinkedIniin, Facebook-sivulle, Instagramiin
+             ja Threadsiin; avaa oman Facebook-profiilin jakoikkunan
+  clip     — lyhyt pystyvideo (Klippi.md) natiivina videona YouTubeen (Shorts),
+             Instagramiin ja Facebook-sivulle (Reels), Threadsiin, Mastodoniin,
+             Blueskyhin ja LinkedIniin — ei blogiin eikä Podbeaniin
+  check    — tarkistaa tunnukset (ei muutoksia)
+  auth youtube|linkedin — OAuth-kirjautuminen selaimessa (tallentaa tokenit)
+
+Usage:
+  kaikuja-publish [--dry-run] [--only podbean,wordpress,...] prepare|publish <Julkaisu.md>
+  kaikuja-publish [--dry-run] [--only youtube,instagram,...] clip <Klippi.md>
+  kaikuja-publish check
+  kaikuja-publish auth youtube|linkedin
+
+YouTube-video ladataan rajapinnalla vain, jos YOUTUBE_UPLOAD=1 (vaatii YouTuben
+API-auditoinnin; muuten lataukset lukittuvat yksityisiksi). Ilman sitä skripti
+käyttää kanavan uusinta käsin ladattua ei-julkista videota.
+
+Tunnukset: ~/bin/.env (ks. bin/kaikuja-publish.md). Tokenit: ~/.config/kaikuja-publish/tokens.json
+Jokainen onnistunut vaihe kirjataan Julkaisu.md:n frontmatteriin, joten ajon voi
+toistaa turvallisesti — jo tehdyt vaiheet ohitetaan.
+"""
+import argparse
+import base64
+import http.server
+import json
+import mimetypes
+import os
+import re
+import secrets
+import subprocess
+import sys
+import time
+import urllib.parse
+import webbrowser
+from datetime import datetime, timezone
+from pathlib import Path
+
+import requests
+
+ENV_FILE = Path(os.environ.get('KAIKUJA_PUBLISH_ENV', Path.home() / 'bin/.env'))
+TOKENS = Path.home() / '.config/kaikuja-publish/tokens.json'
+REDIRECT_PORT = 8765
+REDIRECT = f'http://localhost:{REDIRECT_PORT}/callback'
+GRAPH = 'https://graph.facebook.com/v21.0'
+TH = 'https://graph.threads.net/v1.0'
+DRY = False
+
+
+# ── apurit ──────────────────────────────────────────────────────────────────
+
+def load_env():
+    if ENV_FILE.exists():
+        for line in ENV_FILE.read_text().splitlines():
+            m = re.match(r'\s*(?:export\s+)?([A-Z_][A-Z0-9_]*)=(.*)$', line)
+            if m and m.group(1) not in os.environ:
+                os.environ[m.group(1)] = m.group(2).strip().strip('"\'')
+
+
+def env(name, required=True):
+    v = os.environ.get(name, '')
+    if required and not v:
+        raise SystemExit(f'Puuttuu {name} tiedostosta {ENV_FILE}')
+    return v
+
+
+def tokens():
+    return json.loads(TOKENS.read_text()) if TOKENS.exists() else {}
+
+
+def save_tokens(t):
+    TOKENS.parent.mkdir(parents=True, exist_ok=True)
+    TOKENS.write_text(json.dumps(t, indent=2))
+    TOKENS.chmod(0o600)
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def check(r, what):
+    if r.status_code >= 300:
+        raise SystemExit(f'{what} epäonnistui: HTTP {r.status_code}\n{r.text[:2000]}')
+    return r
+
+
+class Doc:
+    """Julkaisu.md: frontmatter (key: value) + '## avain' -osiot."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        text = self.path.read_text()
+        m = re.match(r'^---\n(.*?)\n---\n(.*)$', text, re.S)
+        if not m:
+            raise SystemExit(f'{path}: frontmatter puuttuu')
+        self.fm_lines = m.group(1).splitlines()
+        self.body = m.group(2)
+        self.sections = {}
+        for sm in re.finditer(r'^## (\S+)[^\n]*\n(.*?)(?=^## |\Z)', self.body, re.S | re.M):
+            self.sections[sm.group(1).lower()] = sm.group(2).strip()
+
+    def get(self, key, default=''):
+        for line in self.fm_lines:
+            k, _, v = line.partition(':')
+            if k.strip() == key:
+                return v.strip().strip('"')
+        return default
+
+    def set(self, key, value):
+        if DRY:
+            log(f'  [dry-run] frontmatter {key}: {value}')
+            return
+        new = f'{key}: "{value}"' if re.search(r'[:#]', str(value)) else f'{key}: {value}'
+        for i, line in enumerate(self.fm_lines):
+            if line.partition(':')[0].strip() == key:
+                self.fm_lines[i] = new
+                break
+        else:
+            self.fm_lines.append(new)
+        self.path.write_text('---\n' + '\n'.join(self.fm_lines) + '\n---\n' + self.body)
+
+    def section(self, key, required=True):
+        v = self.sections.get(key, '')
+        if required and not v:
+            raise SystemExit(f'Julkaisu.md: osio "## {key}" puuttuu tai on tyhjä')
+        # HTML-kommentit (ohjeet/merkkimäärät) pois
+        v = re.sub(r'<!--.*?-->', '', v, flags=re.S)
+        return '\n'.join(line.rstrip() for line in v.splitlines()).strip()
+
+    def fill(self, text, strict=True):
+        """Korvaa {youtube} {podbean} {blogi} {jakso} -paikkamerkit. strict=False jättää puuttuvat ennalleen."""
+        for k, fm in (('youtube', 'youtube_url'), ('podbean', 'podbean_url'), ('blogi', 'wp_url'),
+                      ('jakso', 'jakso_url')):
+            if '{' + k + '}' in text:
+                url = self.get(fm)
+                if not url:
+                    if DRY:
+                        url = f'https://example.invalid/{k}'
+                    elif not strict:
+                        continue
+                    else:
+                        raise SystemExit(f'Paikkamerkki {{{k}}} käytössä mutta {fm} puuttuu — aja ensin prepare/publish')
+                text = text.replace('{' + k + '}', url)
+        return text
+
+    def file(self, key):
+        p = Path(os.path.expanduser(self.get(key)))
+        if not p.is_file():
+            raise SystemExit(f'Julkaisu.md: {key} ei osoita tiedostoon: {p}')
+        return p
+
+
+def video_info(path):
+    """(leveys, korkeus, kesto sekunteina) ffprobella."""
+    r = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries',
+                        'stream=width,height:format=duration', '-of', 'json', str(path)],
+                       capture_output=True, text=True, check=True)
+    d = json.loads(r.stdout)
+    return d['streams'][0]['width'], d['streams'][0]['height'], float(d['format']['duration'])
+
+
+def poll(fn, what, timeout=900, every=5):
+    """Kutsuu fn():ää kunnes se palauttaa muuta kuin None (videoiden käsittely palveluissa)."""
+    end = time.time() + timeout
+    while time.time() < end:
+        v = fn()
+        if v is not None:
+            return v
+        time.sleep(every)
+    raise SystemExit(f'{what}: aikakatkaisu ({timeout} s)')
+
+
+def mb(path):
+    return f'{path.stat().st_size / 2**20:.0f} MB'
+
+
+# ── OAuth (YouTube, LinkedIn) ───────────────────────────────────────────────
+
+def oauth_browser(auth_url, params):
+    state = secrets.token_urlsafe(16)
+    params = {**params, 'state': state, 'redirect_uri': REDIRECT, 'response_type': 'code'}
+    result = {}
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            result.update({k: v[0] for k, v in q.items()})
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.end_headers()
+            self.wfile.write('<h2>Valmis — voit sulkea välilehden.</h2>'.encode())
+
+        def log_message(self, *a):
+            pass
+
+    url = auth_url + '?' + urllib.parse.urlencode(params)
+    log(f'Avaa selaimessa (avautuu automaattisesti):\n{url}')
+    webbrowser.open(url)
+    srv = http.server.HTTPServer(('localhost', REDIRECT_PORT), H)
+    while 'code' not in result and 'error' not in result:
+        srv.handle_request()
+    if result.get('state') != state or 'code' not in result:
+        raise SystemExit(f'OAuth epäonnistui: {result}')
+    return result['code']
+
+
+def auth_youtube():
+    code = oauth_browser('https://accounts.google.com/o/oauth2/v2/auth', {
+        'client_id': env('YOUTUBE_CLIENT_ID'),
+        'scope': 'https://www.googleapis.com/auth/youtube',
+        'access_type': 'offline', 'prompt': 'consent'})
+    r = check(requests.post('https://oauth2.googleapis.com/token', data={
+        'code': code, 'client_id': env('YOUTUBE_CLIENT_ID'),
+        'client_secret': env('YOUTUBE_CLIENT_SECRET'),
+        'redirect_uri': REDIRECT, 'grant_type': 'authorization_code'}), 'YouTube token')
+    t = tokens()
+    t['youtube'] = r.json()
+    save_tokens(t)
+    log('YouTube-kirjautuminen tallennettu.')
+
+
+def youtube_token():
+    t = tokens().get('youtube')
+    if not t or 'refresh_token' not in t:
+        raise SystemExit('YouTube: aja ensin  kaikuja-publish auth youtube')
+    r = check(requests.post('https://oauth2.googleapis.com/token', data={
+        'client_id': env('YOUTUBE_CLIENT_ID'), 'client_secret': env('YOUTUBE_CLIENT_SECRET'),
+        'refresh_token': t['refresh_token'], 'grant_type': 'refresh_token'}), 'YouTube token refresh')
+    return r.json()['access_token']
+
+
+def auth_linkedin():
+    code = oauth_browser('https://www.linkedin.com/oauth/v2/authorization', {
+        'client_id': env('LINKEDIN_CLIENT_ID'), 'scope': 'openid profile w_member_social'})
+    r = check(requests.post('https://www.linkedin.com/oauth/v2/accessToken', data={
+        'grant_type': 'authorization_code', 'code': code, 'redirect_uri': REDIRECT,
+        'client_id': env('LINKEDIN_CLIENT_ID'),
+        'client_secret': env('LINKEDIN_CLIENT_SECRET')}), 'LinkedIn token')
+    tok = r.json()
+    me = check(requests.get('https://api.linkedin.com/v2/userinfo',
+                            headers={'Authorization': f'Bearer {tok["access_token"]}'}), 'LinkedIn userinfo').json()
+    tok['person_urn'] = f'urn:li:person:{me["sub"]}'
+    tok['expires_at'] = int(time.time()) + int(tok.get('expires_in', 0))
+    t = tokens()
+    t['linkedin'] = tok
+    save_tokens(t)
+    log(f'LinkedIn-kirjautuminen tallennettu ({me.get("name")}), voimassa '
+        f'{datetime.fromtimestamp(tok["expires_at"]).date()} asti.')
+
+
+def linkedin_token():
+    t = tokens().get('linkedin')
+    if not t:
+        raise SystemExit('LinkedIn: aja ensin  kaikuja-publish auth linkedin')
+    if t.get('expires_at', 0) < time.time() + 3600:
+        raise SystemExit('LinkedIn-token vanhentunut — aja  kaikuja-publish auth linkedin')
+    return t
+
+
+def threads_token():
+    """Threads-token (60 pv) uusitaan viikon välein; uusittu token tallentuu tokens.json:iin.
+    Jos THREADS_TOKEN vaihtuu .env:ssä, käytetään uutta."""
+    src = env('THREADS_TOKEN')
+    t = tokens().get('threads')
+    if not t or t.get('env') != src:
+        t = {'access_token': src, 'env': src, 'refreshed': 0}
+    if not DRY and time.time() - t['refreshed'] > 7 * 86400:
+        # onnistuu vasta kun token on yli vuorokauden vanha — epäonnistuminen ei haittaa
+        r = requests.get('https://graph.threads.net/refresh_access_token', params={
+            'grant_type': 'th_refresh_token', 'access_token': t['access_token']})
+        if r.ok:
+            t.update(access_token=r.json()['access_token'], refreshed=time.time(),
+                     expires_at=time.time() + r.json().get('expires_in', 0))
+            all_t = tokens()
+            all_t['threads'] = t
+            save_tokens(all_t)
+    return t['access_token']
+
+
+# ── Podbean ─────────────────────────────────────────────────────────────────
+
+PB = 'https://api.podbean.com/v1'
+
+
+def podbean_token():
+    r = check(requests.post(f'{PB}/oauth/token', data={'grant_type': 'client_credentials'},
+                            auth=(env('PODBEAN_CLIENT_ID'), env('PODBEAN_CLIENT_SECRET'))), 'Podbean token')
+    return r.json()['access_token']
+
+
+def podbean_upload(tok, path, ctype):
+    r = check(requests.get(f'{PB}/files/uploadAuthorize', params={
+        'access_token': tok, 'filename': path.name, 'filesize': path.stat().st_size,
+        'content_type': ctype}), 'Podbean uploadAuthorize').json()
+    with open(path, 'rb') as f:
+        check(requests.put(r['presigned_url'], data=f, headers={'Content-Type': ctype}), f'Podbean upload {path.name}')
+    return r['file_key']
+
+
+def podbean_prepare(doc):
+    if doc.get('podbean_id'):
+        log(f'Podbean: luonnos on jo olemassa ({doc.get("podbean_url")})')
+        return
+    mp3, thumb = doc.file('mp3'), doc.file('kansikuva')
+    title, content = doc.section('podbean-otsikko'), doc.section('podbean-kuvaus')
+    if DRY:
+        log(f'  [dry-run] Podbean: lataisi {mp3.name} ({mp3.stat().st_size >> 20} MB) ja '
+            f'loisi luonnoksen "{title}"')
+        return
+    tok = podbean_token()
+    log(f'Podbean: ladataan {mp3.name}…')
+    media_key = podbean_upload(tok, mp3, 'audio/mpeg')
+    logo_key = podbean_upload(tok, thumb, 'image/jpeg')
+    r = check(requests.post(f'{PB}/episodes', data={
+        'access_token': tok, 'title': title, 'content': text_to_html(content),
+        'status': 'draft', 'type': 'public', 'media_key': media_key, 'logo_key': logo_key}),
+        'Podbean episode').json()['episode']
+    doc.set('podbean_id', r['id'])
+    doc.set('podbean_url', r.get('permalink_url', ''))
+    doc.set('podbean_player', r.get('player_url', ''))
+    log(f'Podbean: luonnos tehty ({r.get("permalink_url")})')
+
+
+def podbean_publish(doc):
+    if doc.get('podbean_julkaistu'):
+        log('Podbean: jo julkaistu')
+        return
+    if DRY:
+        log('  [dry-run] Podbean: julkaisisi jakson')
+        return
+    tok = podbean_token()
+    r = check(requests.post(f'{PB}/episodes/{doc.get("podbean_id")}', data={
+        'access_token': tok, 'status': 'publish', 'type': 'public',
+        'title': doc.section('podbean-otsikko'),
+        'content': text_to_html(doc.section('podbean-kuvaus'))}), 'Podbean publish').json()['episode']
+    doc.set('podbean_url', r.get('permalink_url', doc.get('podbean_url')))
+    doc.set('podbean_player', r.get('player_url', doc.get('podbean_player')))
+    doc.set('podbean_julkaistu', today())
+    log(f'Podbean: julkaistu {r.get("permalink_url")}')
+
+
+# ── WordPress ───────────────────────────────────────────────────────────────
+
+def wp(method, path, **kw):
+    base = env('WP_URL').rstrip('/')
+    auth = (env('WP_USER'), env('WP_APP_PASSWORD'))
+    return requests.request(method, f'{base}/wp-json/wp/v2/{path}', auth=auth, timeout=120, **kw)
+
+
+def text_to_html(text):
+    """Kappaleet <p>, rivinvaihdot <br>, URLit linkeiksi."""
+    def link(m):
+        u = m.group(0)
+        return f'<a href="{u}" target="_blank" rel="noreferrer noopener">{u}</a>'
+    out = []
+    for para in re.split(r'\n\s*\n', text.strip()):
+        para = para.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+        para = re.sub(r'https?://[^\s<]+', link, para)
+        out.append('<p>' + para.replace('\n', '<br>') + '</p>')
+    return '\n\n'.join(out)
+
+
+def wp_tag_ids(names):
+    ids = []
+    for n in [x.strip() for x in names.split(',') if x.strip()]:
+        found = check(wp('GET', 'tags', params={'search': n, 'per_page': 100}), 'WP tags').json()
+        match = [t for t in found if t['name'].lower() == n.lower()]
+        if match:
+            ids.append(match[0]['id'])
+        else:
+            ids.append(check(wp('POST', 'tags', json={'name': n}), f'WP tag {n}').json()['id'])
+    return ids
+
+
+def wp_body(doc):
+    player = doc.get('podbean_player')
+    html = ''
+    if player:
+        html += (f'<iframe title="{doc.section("podbean-otsikko")}" allowtransparency="true" height="150" '
+                 f'width="100%" style="border: none; min-width: min(100%, 430px);height:150px;" '
+                 f'scrolling="no" data-name="pb-iframe-player" src="{player}" loading="lazy"></iframe>\n\n')
+    html += text_to_html(doc.fill(doc.section('blogi-teksti')))
+    return html
+
+
+def wordpress_prepare(doc):
+    title = doc.section('blogi-otsikko')
+    if DRY:
+        log(f'  [dry-run] WordPress: luonnos "{title}", tagit: {doc.section("blogi-tagit")}, '
+            f'kategoria {env("WP_CATEGORY_ID", False) or 15}')
+        return
+    data = {'title': title, 'content': wp_body(doc), 'status': 'draft',
+            'categories': [int(env('WP_CATEGORY_ID', False) or 15)],
+            'tags': wp_tag_ids(doc.section('blogi-tagit'))}
+    if not doc.get('wp_media_id'):
+        img = doc.file('kansikuva')
+        m = check(wp('POST', 'media', data=img.read_bytes(), headers={
+            'Content-Disposition': f'attachment; filename="{img.name}"',
+            'Content-Type': 'image/jpeg'}), 'WP media').json()
+        doc.set('wp_media_id', m['id'])
+    data['featured_media'] = int(doc.get('wp_media_id'))
+    if doc.get('wp_id'):
+        r = check(wp('POST', f'posts/{doc.get("wp_id")}', json=data), 'WP update').json()
+        log('WordPress: luonnos päivitetty')
+    else:
+        r = check(wp('POST', 'posts', json=data), 'WP create').json()
+        doc.set('wp_id', r['id'])
+        log('WordPress: luonnos tehty')
+    log(f'  esikatselu: {env("WP_URL").rstrip("/")}/?p={r["id"]}&preview=true')
+
+
+def wordpress_publish(doc):
+    if doc.get('wp_julkaistu'):
+        log(f'WordPress: jo julkaistu ({doc.get("wp_url")})')
+        return
+    if DRY:
+        log('  [dry-run] WordPress: päivittäisi ja julkaisisi postauksen')
+        return
+    r = check(wp('POST', f'posts/{doc.get("wp_id")}', json={
+        'status': 'publish', 'content': wp_body(doc), 'title': doc.section('blogi-otsikko')}), 'WP publish').json()
+    doc.set('wp_url', r['link'])
+    doc.set('wp_julkaistu', today())
+    log(f'WordPress: julkaistu {r["link"]}')
+
+
+# ── YouTube ─────────────────────────────────────────────────────────────────
+
+YT = 'https://www.googleapis.com/youtube/v3'
+
+
+def yt_find_latest(tok):
+    h = {'Authorization': f'Bearer {tok}'}
+    ch = check(requests.get(f'{YT}/channels', params={'part': 'contentDetails', 'mine': 'true'}, headers=h),
+               'YouTube channels').json()
+    uploads = ch['items'][0]['contentDetails']['relatedPlaylists']['uploads']
+    items = check(requests.get(f'{YT}/playlistItems', params={
+        'part': 'snippet,status', 'playlistId': uploads, 'maxResults': 5}, headers=h), 'YouTube playlistItems').json()
+    return [(i['snippet']['resourceId']['videoId'], i['snippet']['title'],
+             i['status']['privacyStatus'], i['snippet']['publishedAt']) for i in items['items']]
+
+
+def yt_upload(tok, path, title, desc, tags, privacy):
+    """videos.insert (resumable). Auditoimattoman sovelluksen lataukset lukittuvat yksityisiksi."""
+    ctype = mimetypes.guess_type(path.name)[0] or 'video/mp4'
+    r = check(requests.post('https://www.googleapis.com/upload/youtube/v3/videos',
+                            params={'uploadType': 'resumable', 'part': 'snippet,status'},
+                            headers={'Authorization': f'Bearer {tok}', 'X-Upload-Content-Type': ctype,
+                                     'X-Upload-Content-Length': str(path.stat().st_size)},
+                            json={'snippet': {'title': title, 'description': desc, 'tags': tags,
+                                              'categoryId': env('YOUTUBE_CATEGORY_ID', False) or '27',
+                                              'defaultLanguage': 'fi', 'defaultAudioLanguage': 'fi'},
+                                  'status': {'privacyStatus': privacy, 'selfDeclaredMadeForKids': False}}),
+              'YouTube upload init')
+    log(f'YouTube: ladataan {path.name} ({mb(path)})…')
+    with open(path, 'rb') as f:
+        v = check(requests.put(r.headers['Location'], data=f,
+                               headers={'Authorization': f'Bearer {tok}', 'Content-Type': ctype}),
+                  'YouTube upload').json()
+    return v['id']
+
+
+def youtube_prepare(doc):
+    title, desc = doc.section('youtube-otsikko'), doc.fill(doc.section('youtube-kuvaus'), strict=False)
+    tags = [t.strip() for t in doc.section('youtube-tagit', False).split(',') if t.strip()]
+    if len(title) > 100:
+        raise SystemExit(f'YouTube-otsikko liian pitkä ({len(title)} > 100)')
+    upload = env('YOUTUBE_UPLOAD', False) and not doc.get('youtube_id')
+    if DRY:
+        how = f'lataisi {doc.get("video")} yksityisenä ja ' if upload else ''
+        log(f'  [dry-run] YouTube: {how}asettaisi otsikon "{title}", kuvauksen ({len(desc)} merkkiä), '
+            f'{len(tags)} tagia' + (f' ja thumbnailin {doc.get("kansikuva")}' if doc.get('kansikuva') else ''))
+        if upload or not tokens().get('youtube'):
+            return
+    tok = youtube_token()
+    h = {'Authorization': f'Bearer {tok}'}
+    vid = doc.get('youtube_id')
+    if upload:
+        vid = yt_upload(tok, doc.file('video'), title, desc, tags, 'private')
+        doc.set('youtube_id', vid)
+        doc.set('youtube_url', f'https://youtu.be/{vid}')
+    elif not vid:
+        latest = yt_find_latest(tok)
+        log('YouTube: kanavan viimeisimmät lataukset:')
+        for v in latest:
+            log(f'  {v[0]}  {v[2]:8}  {v[3][:10]}  {v[1]}')
+        cand = [v for v in latest if v[2] != 'public']
+        if not cand:
+            raise SystemExit('YouTube: ei yksityistä/listaamatonta latausta — lataa video ensin Studiossa '
+                             '(yksityisenä) tai aseta youtube_id Julkaisu.md:hen')
+        vid = cand[0][0]
+        log(f'YouTube: valittu {vid} ("{cand[0][1]}")')
+        if DRY:
+            return
+        doc.set('youtube_id', vid)
+        doc.set('youtube_url', f'https://youtu.be/{vid}')
+    if DRY:
+        return
+    check(requests.put(f'{YT}/videos', params={'part': 'snippet'}, headers=h, json={
+        'id': vid, 'snippet': {'title': title, 'description': desc, 'tags': tags,
+                               'categoryId': env('YOUTUBE_CATEGORY_ID', False) or '27',
+                               'defaultLanguage': 'fi', 'defaultAudioLanguage': 'fi'}}), 'YouTube update')
+    if doc.get('kansikuva'):
+        thumb = doc.file('kansikuva')
+        check(requests.post('https://www.googleapis.com/upload/youtube/v3/thumbnails/set',
+                            params={'videoId': vid, 'uploadType': 'media'},
+                            headers={**h, 'Content-Type': 'image/jpeg'}, data=thumb.read_bytes()),
+              'YouTube thumbnail')
+    log(f'YouTube: metatiedot asetettu (https://studio.youtube.com/video/{vid}/edit)')
+
+
+def youtube_clip(doc):
+    if not doc.get('youtube_julkaistu'):
+        youtube_prepare(doc)
+    youtube_publish(doc)
+
+
+def youtube_publish(doc):
+    if doc.get('youtube_julkaistu'):
+        log('YouTube: jo julkinen')
+        return
+    if DRY:
+        log('  [dry-run] YouTube: asettaisi videon julkiseksi')
+        return
+    tok = youtube_token()
+    check(requests.put(f'{YT}/videos', params={'part': 'status'},
+                       headers={'Authorization': f'Bearer {tok}'},
+                       json={'id': doc.get('youtube_id'), 'status': {'privacyStatus': 'public',
+                                                                      'selfDeclaredMadeForKids': False}}),
+          'YouTube publish')
+    doc.set('youtube_julkaistu', today())
+    log(f'YouTube: julkinen {doc.get("youtube_url")}')
+
+
+# ── Mastodon ────────────────────────────────────────────────────────────────
+
+def mastodon_post(doc, video=False):
+    if doc.get('mastodon_url'):
+        log(f'Mastodon: jo postattu ({doc.get("mastodon_url")})')
+        return
+    text = doc.fill(doc.section('mastodon'))
+    limit = int(env('MASTODON_LIMIT', False) or 500)
+    if len(text) > limit:
+        raise SystemExit(f'Mastodon-teksti liian pitkä ({len(text)} > {limit})')
+    if DRY:
+        what = f' + video {doc.get("video")}' if video else ''
+        log(f'  [dry-run] Mastodon ({len(text)}/{limit}){what}:\n{indent(text)}')
+        return
+    base = env('MASTODON_URL').rstrip('/')
+    h = {'Authorization': f'Bearer {env("MASTODON_TOKEN")}'}
+    data = {'status': text, 'language': 'fi', 'visibility': 'public'}
+    if video:
+        path = doc.file('video')
+        log(f'Mastodon: ladataan {path.name} ({mb(path)})…')
+        with open(path, 'rb') as f:
+            m = check(requests.post(f'{base}/api/v2/media', headers=h,
+                                    files={'file': (path.name, f, 'video/mp4')},
+                                    data={'description': doc.section('alt', False)[:1500]}), 'Mastodon media').json()
+
+        def ready():  # 206 = käsittely kesken
+            r = requests.get(f'{base}/api/v1/media/{m["id"]}', headers=h)
+            return r.json() if r.status_code == 200 and r.json().get('url') else None
+        if not m.get('url'):
+            poll(ready, 'Mastodon-videon käsittely')
+        data['media_ids[]'] = m['id']
+    r = check(requests.post(f'{base}/api/v1/statuses',
+                            headers={**h, 'Idempotency-Key': f'kaikuja-{doc.path.parent.name}-{doc.path.stem}'},
+                            data=data), 'Mastodon').json()
+    doc.set('mastodon_url', r['url'])
+    log(f'Mastodon: {r["url"]}')
+
+
+# ── Bluesky ─────────────────────────────────────────────────────────────────
+
+def bsky_facets(text):
+    b = text.encode('utf-8')
+    facets = []
+    for m in re.finditer(rb'https?://[^\s]+', b):
+        url = m.group(0).rstrip(b'.,)!?')
+        facets.append({'index': {'byteStart': m.start(), 'byteEnd': m.start() + len(url)},
+                       'features': [{'$type': 'app.bsky.richtext.facet#link', 'uri': url.decode()}]})
+    for m in re.finditer(rb'(?:^|\s)(#[^\s#.,!?:;]+)', b):
+        tag = m.group(1)
+        facets.append({'index': {'byteStart': m.start(1), 'byteEnd': m.end(1)},
+                       'features': [{'$type': 'app.bsky.richtext.facet#tag', 'tag': tag[1:].decode()}]})
+    return facets
+
+
+BSKY_VIDEO = 'https://video.bsky.app/xrpc'
+
+
+def bsky_video_blob(pds, s, path):
+    """Video Blueskyn videopalvelun kautta: palvelutunnus PDS:ltä, lataus, odotus kunnes käsitelty."""
+    h = {'Authorization': f'Bearer {s["accessJwt"]}'}
+    did_doc = s.get('didDoc') or check(requests.get(f'https://plc.directory/{s["did"]}'), 'Bluesky DID').json()
+    endpoint = next(x['serviceEndpoint'] for x in did_doc['service'] if x['id'].endswith('#atproto_pds'))
+    sa = check(requests.get(f'{pds}/xrpc/com.atproto.server.getServiceAuth', headers=h, params={
+        'aud': 'did:web:' + urllib.parse.urlparse(endpoint).hostname,
+        'lxm': 'com.atproto.repo.uploadBlob', 'exp': int(time.time()) + 1800}), 'Bluesky service auth').json()['token']
+    log(f'Bluesky: ladataan {path.name} ({mb(path)})…')
+    with open(path, 'rb') as f:
+        r = requests.post(f'{BSKY_VIDEO}/app.bsky.video.uploadVideo', params={'did': s['did'], 'name': path.name},
+                          headers={'Authorization': f'Bearer {sa}', 'Content-Type': 'video/mp4'}, data=f)
+    if r.status_code != 409:  # 409 = sama video jo ladattu, vastauksessa silti jobId
+        check(r, 'Bluesky video upload')
+    job = r.json()
+    job = job.get('jobStatus', job)
+    if job.get('blob'):
+        return job['blob']
+
+    def done():
+        st = check(requests.get(f'{BSKY_VIDEO}/app.bsky.video.getJobStatus', params={'jobId': job['jobId']}),
+                   'Bluesky video status').json()['jobStatus']
+        if st['state'] == 'JOB_STATE_FAILED':
+            raise SystemExit(f'Bluesky-videon käsittely epäonnistui: {st.get("error")} {st.get("message")}')
+        return st.get('blob') if st['state'] == 'JOB_STATE_COMPLETED' else None
+    return poll(done, 'Bluesky-videon käsittely')
+
+
+def bluesky_post(doc, video=False):
+    if doc.get('bluesky_url'):
+        log(f'Bluesky: jo postattu ({doc.get("bluesky_url")})')
+        return
+    text = doc.fill(doc.section('bluesky'))
+    if len(text) > 300:
+        raise SystemExit(f'Bluesky-teksti liian pitkä ({len(text)} > 300)')
+    if video:
+        path = doc.file('video')
+        w, hgt, dur = video_info(path)
+        if dur > 180 or path.stat().st_size > 100 * 2**20:
+            raise SystemExit(f'Bluesky: video liian pitkä tai iso ({dur:.0f} s, {mb(path)}; raja 180 s / 100 MB)')
+    else:
+        card_url = doc.fill(doc.get('linkkikortti', '{blogi}'))
+    if DRY:
+        what = f'video {doc.get("video")}' if video else f'linkkikortti {card_url}'
+        log(f'  [dry-run] Bluesky ({len(text)}/300), {what}:\n{indent(text)}')
+        return
+    pds = env('BLUESKY_PDS', False) or 'https://bsky.social'
+    s = check(requests.post(f'{pds}/xrpc/com.atproto.server.createSession', json={
+        'identifier': env('BLUESKY_HANDLE'), 'password': env('BLUESKY_APP_PASSWORD')}), 'Bluesky login').json()
+    h = {'Authorization': f'Bearer {s["accessJwt"]}'}
+    if video:
+        embed = {'$type': 'app.bsky.embed.video', 'video': bsky_video_blob(pds, s, path),
+                 'aspectRatio': {'width': w, 'height': hgt}}
+        if doc.section('alt', False):
+            embed['alt'] = doc.section('alt', False)[:1000]
+    else:
+        blob = check(requests.post(f'{pds}/xrpc/com.atproto.repo.uploadBlob',
+                                   headers={**h, 'Content-Type': 'image/jpeg'},
+                                   data=doc.file('kansikuva').read_bytes()), 'Bluesky blob').json()['blob']
+        embed = {'$type': 'app.bsky.embed.external', 'external': {
+            'uri': card_url, 'title': doc.section('blogi-otsikko'),
+            'description': doc.section('linkkikortti-kuvaus', False)[:300], 'thumb': blob}}
+    record = {'$type': 'app.bsky.feed.post', 'text': text, 'langs': ['fi'],
+              'createdAt': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+              'facets': bsky_facets(text), 'embed': embed}
+    r = check(requests.post(f'{pds}/xrpc/com.atproto.repo.createRecord', headers=h, json={
+        'repo': s['did'], 'collection': 'app.bsky.feed.post', 'record': record}), 'Bluesky post').json()
+    url = f'https://bsky.app/profile/{env("BLUESKY_HANDLE")}/post/{r["uri"].rsplit("/", 1)[1]}'
+    doc.set('bluesky_url', url)
+    log(f'Bluesky: {url}')
+
+
+# ── LinkedIn ────────────────────────────────────────────────────────────────
+
+def li_escape(text):
+    return re.sub(r'([\\|{}@\[\]()<>#*_~])', r'\\\1', text)
+
+
+LI = 'https://api.linkedin.com/rest'
+
+
+def linkedin_video(t, h, path):
+    """Videos API: initializeUpload → osat PUTilla → finalizeUpload → odotus kunnes AVAILABLE."""
+    init = check(requests.post(f'{LI}/videos', params={'action': 'initializeUpload'}, headers=h, json={
+        'initializeUploadRequest': {'owner': t['person_urn'], 'fileSizeBytes': path.stat().st_size,
+                                    'uploadCaptions': False, 'uploadThumbnail': False}}),
+        'LinkedIn video init').json()['value']
+    log(f'LinkedIn: ladataan {path.name} ({mb(path)})…')
+    etags = []
+    with open(path, 'rb') as f:
+        for part in init['uploadInstructions']:
+            f.seek(part['firstByte'])
+            chunk = f.read(part['lastByte'] - part['firstByte'] + 1)
+            r = check(requests.put(part['uploadUrl'], data=chunk,
+                                   headers={'Content-Type': 'application/octet-stream'}), 'LinkedIn video part')
+            etags.append(r.headers['etag'])
+    check(requests.post(f'{LI}/videos', params={'action': 'finalizeUpload'}, headers=h, json={
+        'finalizeUploadRequest': {'video': init['video'], 'uploadToken': init.get('uploadToken', ''),
+                                  'uploadedPartIds': etags}}), 'LinkedIn video finalize')
+
+    def ready():
+        st = check(requests.get(f'{LI}/videos/{urllib.parse.quote(init["video"])}', headers=h),
+                   'LinkedIn video status').json().get('status')
+        if st == 'PROCESSING_FAILED':
+            raise SystemExit('LinkedIn-videon käsittely epäonnistui')
+        return True if st == 'AVAILABLE' else None
+    poll(ready, 'LinkedIn-videon käsittely', every=10)
+    return init['video']
+
+
+def linkedin_post(doc, video=False):
+    if doc.get('linkedin_url'):
+        log(f'LinkedIn: jo postattu ({doc.get("linkedin_url")})')
+        return
+    text = doc.fill(doc.section('linkedin'))
+    card_url = None if video else doc.fill(doc.get('linkkikortti', '{blogi}'))
+    if len(text) > 3000:
+        raise SystemExit(f'LinkedIn-teksti liian pitkä ({len(text)} > 3000)')
+    if DRY:
+        what = f'video {doc.get("video")}' if video else f'linkki {card_url}'
+        log(f'  [dry-run] LinkedIn ({len(text)}/3000), {what}:\n{indent(text)}')
+        return
+    t = linkedin_token()
+    version = env('LINKEDIN_VERSION', False) or (datetime.now().replace(day=1)).strftime('%Y%m')
+    h = {'Authorization': f'Bearer {t["access_token"]}', 'LinkedIn-Version': version,
+         'X-Restli-Protocol-Version': '2.0.0', 'Content-Type': 'application/json'}
+    if video:
+        content = {'media': {'title': doc.section('youtube-otsikko', False)[:200],
+                             'id': linkedin_video(t, h, doc.file('video'))}}
+    else:
+        content = {'article': {'source': card_url, 'title': doc.section('blogi-otsikko'),
+                               'description': doc.section('linkkikortti-kuvaus', False)[:300]}}
+    r = requests.post(f'{LI}/posts', headers=h, json={
+        'author': t['person_urn'], 'commentary': li_escape(text), 'visibility': 'PUBLIC',
+        'distribution': {'feedDistribution': 'MAIN_FEED', 'targetEntities': [],
+                         'thirdPartyDistributionChannels': []},
+        'content': content, 'lifecycleState': 'PUBLISHED', 'isReshareDisabledByAuthor': False})
+    check(r, f'LinkedIn post (LinkedIn-Version {version}; aseta LINKEDIN_VERSION jos versio ei kelpaa)')
+    urn = r.headers.get('x-restli-id', '')
+    url = f'https://www.linkedin.com/feed/update/{urn}/'
+    doc.set('linkedin_url', url)
+    log(f'LinkedIn: {url}')
+
+
+# ── Facebook ────────────────────────────────────────────────────────────────
+
+def facebook_page_post(doc):
+    if doc.get('facebook_sivu_url'):
+        log(f'Facebook-sivu: jo postattu ({doc.get("facebook_sivu_url")})')
+        return
+    text = doc.fill(doc.section('facebook-sivu'))
+    card_url = doc.fill(doc.get('linkkikortti', '{blogi}'))
+    if DRY:
+        log(f'  [dry-run] Facebook-sivu, linkki {card_url}:\n{indent(text)}')
+        return
+    r = check(requests.post(f'https://graph.facebook.com/{env("FB_PAGE_ID")}/feed', data={
+        'message': text, 'link': card_url, 'access_token': env('FB_PAGE_TOKEN')}), 'Facebook page').json()
+    url = f'https://www.facebook.com/{r["id"]}'
+    doc.set('facebook_sivu_url', url)
+    log(f'Facebook-sivu: {url}')
+
+
+def rupload(url, tok, path):
+    """Metan resumable-lataus (Facebook Reels, Instagram): koko tiedosto kerralla."""
+    with open(path, 'rb') as f:
+        return check(requests.post(url, data=f, headers={
+            'Authorization': f'OAuth {tok}', 'offset': '0', 'file_size': str(path.stat().st_size)}),
+            f'Meta upload {path.name}')
+
+
+def facebook_page_reel(doc):
+    if doc.get('facebook_sivu_url'):
+        log(f'Facebook-sivu: jo postattu ({doc.get("facebook_sivu_url")})')
+        return
+    text = doc.fill(doc.section('facebook-sivu'))
+    path = doc.file('video')
+    if DRY:
+        log(f'  [dry-run] Facebook-sivu, Reel {path.name}:\n{indent(text)}')
+        return
+    page, tok = env('FB_PAGE_ID'), env('FB_PAGE_TOKEN')
+    s = check(requests.post(f'{GRAPH}/{page}/video_reels', data={
+        'upload_phase': 'start', 'access_token': tok}), 'Facebook reel start').json()
+    log(f'Facebook-sivu: ladataan {path.name} ({mb(path)})…')
+    rupload(s['upload_url'], tok, path)
+    check(requests.post(f'{GRAPH}/{page}/video_reels', data={
+        'upload_phase': 'finish', 'video_id': s['video_id'], 'video_state': 'PUBLISHED',
+        'description': text, 'access_token': tok}), 'Facebook reel publish')
+    url = f'https://www.facebook.com/reel/{s["video_id"]}'
+    doc.set('facebook_sivu_url', url)
+    log(f'Facebook-sivu: {url} (näkyy kun Facebook on käsitellyt videon)')
+
+
+# ── Instagram ───────────────────────────────────────────────────────────────
+
+def ig_publish(doc, container):
+    """Odottaa kunnes kontti on valmis, julkaisee ja kirjaa instagram_id/url."""
+    ig, tok = env('IG_USER_ID'), env('FB_PAGE_TOKEN')
+
+    def ready():
+        st = check(requests.get(f'{GRAPH}/{container}', params={
+            'fields': 'status_code,status', 'access_token': tok}), 'Instagram status').json()
+        if st.get('status_code') in ('ERROR', 'EXPIRED'):
+            raise SystemExit(f'Instagram-käsittely epäonnistui: {st}')
+        return True if st.get('status_code') == 'FINISHED' else None
+    poll(ready, 'Instagram-käsittely')
+    mid = check(requests.post(f'{GRAPH}/{ig}/media_publish', data={
+        'creation_id': container, 'access_token': tok}), 'Instagram publish').json()['id']
+    url = check(requests.get(f'{GRAPH}/{mid}', params={'fields': 'permalink', 'access_token': tok}),
+                'Instagram permalink').json()['permalink']
+    doc.set('instagram_id', mid)
+    doc.set('instagram_url', url)
+    log(f'Instagram: {url}')
+
+
+def instagram_text(doc):
+    text = doc.fill(doc.section('instagram'))
+    if len(text) > 2200 or text.count('#') > 30:
+        raise SystemExit(f'Instagram-teksti liian pitkä ({len(text)}/2200) tai liikaa hashtageja (max 30)')
+    return text
+
+
+def instagram_post(doc):
+    """Jakso: kuvapostaus (thumbnail). Kuvan pitää olla julkisessa URLissa — oletuksena blogin artikkelikuva."""
+    if doc.get('instagram_url'):
+        log(f'Instagram: jo postattu ({doc.get("instagram_url")})')
+        return
+    text = instagram_text(doc)
+    if DRY:
+        log(f'  [dry-run] Instagram ({len(text)}/2200), kuva {doc.get("instagram_kuva_url") or "blogin artikkelikuva"}:'
+            f'\n{indent(text)}')
+        return
+    img = doc.get('instagram_kuva_url')
+    if not img:
+        if not doc.get('wp_media_id'):
+            raise SystemExit('Instagram tarvitsee kuvan julkisessa URLissa: aja wordpress-vaihe ensin '
+                             'tai aseta instagram_kuva_url')
+        img = check(wp('GET', f'media/{doc.get("wp_media_id")}'), 'WP media').json()['source_url']
+    c = check(requests.post(f'{GRAPH}/{env("IG_USER_ID")}/media', data={
+        'image_url': img, 'caption': text, 'access_token': env('FB_PAGE_TOKEN')}), 'Instagram container').json()
+    ig_publish(doc, c['id'])
+
+
+def instagram_reel(doc):
+    if doc.get('instagram_url'):
+        log(f'Instagram: jo postattu ({doc.get("instagram_url")})')
+        return
+    text, path = instagram_text(doc), doc.file('video')
+    if DRY:
+        log(f'  [dry-run] Instagram ({len(text)}/2200), Reel {path.name}:\n{indent(text)}')
+        return
+    tok = env('FB_PAGE_TOKEN')
+    c = check(requests.post(f'{GRAPH}/{env("IG_USER_ID")}/media', data={
+        'media_type': 'REELS', 'upload_type': 'resumable', 'caption': text, 'share_to_feed': 'true',
+        'access_token': tok}), 'Instagram container').json()
+    log(f'Instagram: ladataan {path.name} ({mb(path)})…')
+    rupload(c.get('uri') or f'https://rupload.facebook.com/ig-api-upload/v21.0/{c["id"]}', tok, path)
+    ig_publish(doc, c['id'])
+
+
+# ── Threads ─────────────────────────────────────────────────────────────────
+
+def threads_post(doc, video=False):
+    """Jakso: teksti + linkkikortti. Klippi: video — Threads hakee videon julkisesta URLista, joten
+    käytetään juuri julkaistun Instagram-Reelin media_url:ia (instagram-vaihe ensin)."""
+    if doc.get('threads_url'):
+        log(f'Threads: jo postattu ({doc.get("threads_url")})')
+        return
+    text = doc.fill(doc.section('threads'))
+    if len(text) > 500:
+        raise SystemExit(f'Threads-teksti liian pitkä ({len(text)} > 500)')
+    if DRY:
+        what = 'video (Instagram-Reelistä)' if video else f'linkki {doc.fill(doc.get("linkkikortti", "{blogi}"))}'
+        log(f'  [dry-run] Threads ({len(text)}/500), {what}:\n{indent(text)}')
+        return
+    uid, tok = env('THREADS_USER_ID'), threads_token()
+    data = {'text': text, 'access_token': tok}
+    if video:
+        if not doc.get('instagram_id'):
+            raise SystemExit('Threads-video tarvitsee Instagram-Reelin (aja instagram-vaihe ensin)')
+        data.update(media_type='VIDEO', video_url=check(requests.get(f'{GRAPH}/{doc.get("instagram_id")}', params={
+            'fields': 'media_url', 'access_token': env('FB_PAGE_TOKEN')}), 'Instagram media_url').json()['media_url'])
+    else:
+        data.update(media_type='TEXT', link_attachment=doc.fill(doc.get('linkkikortti', '{blogi}')))
+    cid = check(requests.post(f'{TH}/{uid}/threads', data=data), 'Threads container').json()['id']
+
+    def ready():
+        st = check(requests.get(f'{TH}/{cid}', params={'fields': 'status,error_message', 'access_token': tok}),
+                   'Threads status').json()
+        if st.get('status') in ('ERROR', 'EXPIRED'):
+            raise SystemExit(f'Threads-käsittely epäonnistui: {st}')
+        return True if st.get('status') == 'FINISHED' else None
+    poll(ready, 'Threads-käsittely')
+    tid = check(requests.post(f'{TH}/{uid}/threads_publish', data={'creation_id': cid, 'access_token': tok}),
+                'Threads publish').json()['id']
+    url = check(requests.get(f'{TH}/{tid}', params={'fields': 'permalink', 'access_token': tok}),
+                'Threads permalink').json()['permalink']
+    doc.set('threads_url', url)
+    log(f'Threads: {url}')
+
+
+def facebook_own(doc):
+    text = doc.fill(doc.section('facebook-oma'))
+    card_url = doc.fill(doc.get('linkkikortti', '{blogi}'))
+    log('Facebook (oma profiili) — rajapinta ei salli, jaa käsin:')
+    log(indent(text))
+    if DRY:
+        return
+    try:
+        subprocess.run(['xclip', '-selection', 'clipboard'], input=text.encode(), check=True)
+        log('  (teksti kopioitu leikepöydälle)')
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    webbrowser.open('https://www.facebook.com/sharer/sharer.php?u=' + urllib.parse.quote(card_url))
+
+
+# ── tarkistus ───────────────────────────────────────────────────────────────
+
+def check_all():
+    def ok(name, fn):
+        try:
+            log(f'  OK    {name}: {fn()}')
+        except SystemExit as e:
+            log(f'  PUUTTUU {name}: {str(e).splitlines()[0]}')
+        except Exception as e:  # noqa
+            log(f'  VIRHE {name}: {e}')
+    ok('Podbean', lambda: podbean_token() and 'token saatu')
+    ok('WordPress', lambda: check(wp('GET', 'users/me'), 'WP').json()['name'])
+    ok('YouTube', lambda: f'{len(yt_find_latest(youtube_token()))} viimeisintä latausta luettu')
+    ok('Mastodon', lambda: check(requests.get(
+        f'{env("MASTODON_URL").rstrip("/")}/api/v1/accounts/verify_credentials',
+        headers={'Authorization': f'Bearer {env("MASTODON_TOKEN")}'}), 'Mastodon').json()['acct'])
+    ok('Bluesky', lambda: check(requests.post(
+        f'{env("BLUESKY_PDS", False) or "https://bsky.social"}/xrpc/com.atproto.server.createSession',
+        json={'identifier': env('BLUESKY_HANDLE'), 'password': env('BLUESKY_APP_PASSWORD')}),
+        'Bluesky').json()['handle'])
+    ok('LinkedIn', lambda: f'{linkedin_token()["person_urn"]}, voimassa '
+                           f'{datetime.fromtimestamp(linkedin_token()["expires_at"]).date()} asti')
+    ok('Facebook-sivu', lambda: check(requests.get(f'https://graph.facebook.com/{env("FB_PAGE_ID")}',
+                                                   params={'access_token': env('FB_PAGE_TOKEN')}),
+                                      'Facebook').json()['name'])
+    ok('Instagram', lambda: '@' + check(requests.get(f'{GRAPH}/{env("IG_USER_ID")}', params={
+        'fields': 'username', 'access_token': env('FB_PAGE_TOKEN')}), 'Instagram').json()['username'])
+    ok('Threads', lambda: '@' + check(requests.get(f'{TH}/me', params={
+        'fields': 'username', 'access_token': threads_token()}), 'Threads').json()['username'])
+    log(f'  YouTube-lataus rajapinnalla: {"päällä" if env("YOUTUBE_UPLOAD", False) else "pois (käsin ladattu video)"}')
+
+
+def indent(t):
+    return '\n'.join('    ' + line for line in t.splitlines())
+
+
+def today():
+    return datetime.now().strftime('%Y-%m-%d')
+
+
+PREPARE = {'podbean': podbean_prepare, 'wordpress': wordpress_prepare, 'youtube': youtube_prepare}
+PUBLISH = {'podbean': podbean_publish, 'youtube': youtube_publish, 'wordpress': wordpress_publish,
+           'mastodon': mastodon_post, 'bluesky': bluesky_post, 'linkedin': linkedin_post,
+           'facebook-sivu': facebook_page_post, 'instagram': instagram_post, 'threads': threads_post,
+           'facebook-oma': facebook_own}
+# klipit: ei blogia eikä Podbeania. Instagram ennen Threadsia (Threads käyttää Reelin videota).
+CLIP = {'youtube': youtube_clip, 'instagram': instagram_reel,
+        'threads': lambda d: threads_post(d, video=True), 'facebook-sivu': facebook_page_reel,
+        'mastodon': lambda d: mastodon_post(d, video=True), 'bluesky': lambda d: bluesky_post(d, video=True),
+        'linkedin': lambda d: linkedin_post(d, video=True)}
+
+
+def main():
+    global DRY
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--dry-run', action='store_true')
+    ap.add_argument('--only', help='pilkulla erotettu lista vaiheita')
+    ap.add_argument('cmd', choices=['prepare', 'publish', 'clip', 'check', 'auth'])
+    ap.add_argument('arg', nargs='?')
+    a = ap.parse_args()
+    DRY = a.dry_run
+    load_env()
+    if a.cmd == 'check':
+        return check_all()
+    if a.cmd == 'auth':
+        return {'youtube': auth_youtube, 'linkedin': auth_linkedin}[a.arg]()
+    doc = Doc(a.arg)
+    steps = {'prepare': PREPARE, 'publish': PUBLISH, 'clip': CLIP}[a.cmd]
+    if a.cmd == 'clip':
+        w, h, dur = video_info(doc.file('video'))
+        log(f'Klippi: {doc.get("video")} — {w}×{h}, {dur:.0f} s, {mb(doc.file("video"))}')
+        if h <= w or dur > 180:
+            log('  HUOM: YouTube Shorts vaatii pystyvideon ja enintään 3 min (muuten tavallinen video)')
+    only = [s.strip() for s in a.only.split(',')] if a.only else list(steps)
+    for name in only:
+        if name not in steps:
+            raise SystemExit(f'Tuntematon vaihe {name}; vaihtoehdot: {", ".join(steps)}')
+    for name, fn in steps.items():
+        if name in only:
+            fn(doc)
+
+
+if __name__ == '__main__':
+    main()
