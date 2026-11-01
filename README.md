@@ -69,4 +69,16 @@ OAuth tokens are stored only on the local machine in `~/.config/kaikuja-publish/
 (file mode 600). Access can be revoked at any time at
 <https://myaccount.google.com/permissions>; deleting that file removes the local copy.
 
+### Scheduling clips for social media
+
+Clips (shorts) can be scheduled for later publication to social media platforms:
+
+```bash
+kaikuja-publish --schedule "2026-11-05 09:00" clip clips.md
+kaikuja-publish publish-scheduled      # publishes all due clips
+```
+
+Scheduled clips are stored in `~/.config/kaikuja-publish/scheduled.json`. You can run
+`publish-scheduled` manually or via cron to execute scheduled posts at the right time.
+
 Comments and command output in the script are in Finnish, the language of the podcast.

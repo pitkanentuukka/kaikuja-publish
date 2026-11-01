@@ -12,17 +12,24 @@ Lukee jakson Julkaisu.md-tiedoston (frontmatter + "## avain" -osiot) ja tekee:
   clip     — lyhyt pystyvideo (Klippi.md) natiivina videona YouTubeen (Shorts),
              Instagramiin ja Facebook-sivulle (Reels), Threadsiin, Mastodoniin,
              Blueskyhin ja LinkedIniin — ei blogiin eikä Podbeaniin
+  publish-scheduled — julkaisee kaikki ajoituksensa erääntyneet klipit
   check    — tarkistaa tunnukset (ei muutoksia)
   auth youtube|linkedin — OAuth-kirjautuminen selaimessa (tallentaa tokenit)
 
 Usage:
   kaikuja-publish [--dry-run] [--only podbean,wordpress,...] prepare|publish <Julkaisu.md>
   kaikuja-publish [--dry-run] [--only youtube,instagram,...] clip <Klippi.md>
+  kaikuja-publish [--schedule "YYYY-MM-DD HH:MM"] clip <Klippi.md>
+  kaikuja-publish publish-scheduled
   kaikuja-publish check
   kaikuja-publish auth youtube|linkedin
 
+--schedule: Ajoita klippi myöhemmäksi julkaisuksi (sosiaalisiin medioihin). Aika UTC.
+            Käytä publish-scheduled-komentoa tai aseta cron-tehtävä tarkistamaan
+            ja julkaisemaan ajoitettuja klippejä.
+
 YouTube-video ladataan rajapinnalla vain, jos YOUTUBE_UPLOAD=1 (vaatii YouTuben
-API-auditoinnin; muuten lataukset lukittuvat yksityisiksi). Ilman sitä skripti
+API-auditoinnin; muuten lataukset lukittyvät yksityisiksi). Ilman sitä skripti
 käyttää kanavan uusinta käsin ladattua ei-julkista videota.
 
 Tunnukset: ~/bin/.env (ks. bin/kaikuja-publish.md). Tokenit: ~/.config/kaikuja-publish/tokens.json
@@ -49,6 +56,7 @@ import requests
 
 ENV_FILE = Path(os.environ.get('KAIKUJA_PUBLISH_ENV', Path.home() / 'bin/.env'))
 TOKENS = Path.home() / '.config/kaikuja-publish/tokens.json'
+SCHEDULED = Path.home() / '.config/kaikuja-publish/scheduled.json'
 REDIRECT_PORT = 8765
 REDIRECT = f'http://localhost:{REDIRECT_PORT}/callback'
 GRAPH = 'https://graph.facebook.com/v21.0'
@@ -81,6 +89,68 @@ def save_tokens(t):
     TOKENS.parent.mkdir(parents=True, exist_ok=True)
     TOKENS.write_text(json.dumps(t, indent=2))
     TOKENS.chmod(0o600)
+
+
+def load_scheduled():
+    return json.loads(SCHEDULED.read_text()) if SCHEDULED.exists() else {}
+
+
+def save_scheduled(s):
+    SCHEDULED.parent.mkdir(parents=True, exist_ok=True)
+    SCHEDULED.write_text(json.dumps(s, indent=2, default=str))
+    SCHEDULED.chmod(0o600)
+
+
+def schedule_clip(doc, scheduled_dt):
+    """Tallenna klippi myöhemmäksi julkaisuksi."""
+    s = load_scheduled()
+    clip_id = f"{scheduled_dt.isoformat()}_{doc.get('jakso')}_{secrets.token_hex(4)}"
+    s[clip_id] = {
+        'klippi_path': str(doc.path),
+        'scheduled_at': scheduled_dt.isoformat(),
+        'jakso': doc.get('jakso'),
+    }
+    save_scheduled(s)
+    log(f'Klippi on ajoitettu {scheduled_dt.isoformat()}')
+    return clip_id
+
+
+def publish_scheduled():
+    """Julkaise ajoituksensa erääntyneet klipit."""
+    s = load_scheduled()
+    if not s:
+        log('Ei ajoitettuja klippejä.')
+        return
+    now = datetime.now(timezone.utc)
+    to_publish = []
+    remaining = {}
+
+    for clip_id, info in s.items():
+        scheduled_dt = datetime.fromisoformat(info['scheduled_at'])
+        if scheduled_dt <= now:
+            to_publish.append((clip_id, info))
+        else:
+            remaining[clip_id] = info
+
+    if not to_publish:
+        soonest = min(s.items(), key=lambda x: x[1]['scheduled_at'])
+        dt = soonest[1]['scheduled_at']
+        log(f'Seuraava klippi ajoitettu {dt}')
+        return
+
+    for clip_id, info in to_publish:
+        log(f'Julkaistaan ajoitettu klippi {clip_id}…')
+        doc = Doc(info['klippi_path'])
+        only = [s.strip() for s in sys.argv[2:]] if len(sys.argv) > 2 else list(CLIP)
+        for name, fn in CLIP.items():
+            if name in only:
+                fn(doc)
+        log(f'Klippi julkaistu: {clip_id}')
+
+    save_scheduled(remaining)
+    if remaining:
+        soonest = min(remaining.items(), key=lambda x: x[1]['scheduled_at'])
+        log(f'Seuraava ajoitettu klippi {soonest[0]} erääntyi {soonest[1]["scheduled_at"]}')
 
 
 def log(msg):
@@ -969,7 +1039,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--dry-run', action='store_true')
     ap.add_argument('--only', help='pilkulla erotettu lista vaiheita')
-    ap.add_argument('cmd', choices=['prepare', 'publish', 'clip', 'check', 'auth'])
+    ap.add_argument('--schedule', help='ajoita klippi myöhemmäksi (muoto: YYYY-MM-DD HH:MM)', metavar='AIKA')
+    ap.add_argument('cmd', choices=['prepare', 'publish', 'clip', 'check', 'auth', 'publish-scheduled'])
     ap.add_argument('arg', nargs='?')
     a = ap.parse_args()
     DRY = a.dry_run
@@ -978,6 +1049,8 @@ def main():
         return check_all()
     if a.cmd == 'auth':
         return {'youtube': auth_youtube, 'linkedin': auth_linkedin}[a.arg]()
+    if a.cmd == 'publish-scheduled':
+        return publish_scheduled()
     doc = Doc(a.arg)
     steps = {'prepare': PREPARE, 'publish': PUBLISH, 'clip': CLIP}[a.cmd]
     if a.cmd == 'clip':
@@ -985,6 +1058,15 @@ def main():
         log(f'Klippi: {doc.get("video")} — {w}×{h}, {dur:.0f} s, {mb(doc.file("video"))}')
         if h <= w or dur > 180:
             log('  HUOM: YouTube Shorts vaatii pystyvideon ja enintään 3 min (muuten tavallinen video)')
+        if a.schedule:
+            try:
+                scheduled_dt = datetime.fromisoformat(a.schedule.replace(' ', 'T'))
+                if scheduled_dt <= datetime.now():
+                    raise SystemExit(f'Aika on jo mennyt: {a.schedule}')
+                schedule_clip(doc, scheduled_dt)
+                return
+            except ValueError:
+                raise SystemExit(f'Väärä aikamuoto: {a.schedule}; käytä YYYY-MM-DD HH:MM')
     only = [s.strip() for s in a.only.split(',')] if a.only else list(steps)
     for name in only:
         if name not in steps:
