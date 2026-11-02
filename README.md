@@ -2,7 +2,7 @@
 
 A personal command-line tool that publishes episodes and short clips of the Finnish podcast
 **[Kaikuja Kaikkeudesta](https://www.kaikkeudenkartano.fi/)** ("Echoes from the Universe") to
-YouTube, Podbean, WordPress and social media, from one reviewed text file.
+YouTube, Podbean, WordPress, the podcast's own website and social media, from one reviewed text file.
 
 It is written and used by one person — the podcast's host, Tuukka Pitkänen — on his own
 computer, for his own channels. It has no other users and no server component.
@@ -40,8 +40,9 @@ kaikuja-publish prepare      → uploads the video to YouTube as private, sets m
                                creates Podbean and WordPress drafts
         │  (host checks the private video in YouTube Studio and the drafts)
 kaikuja-publish publish      → switches the YouTube video to public, publishes the drafts,
-                               posts to Mastodon, Bluesky, LinkedIn, Facebook page, Instagram, Threads
-kaikuja-publish clip         → same for a short vertical clip (YouTube Shorts + social media)
+                               updates the website, posts to Mastodon, Bluesky, LinkedIn,
+                               Facebook page, Instagram, Threads
+kaikuja-publish clip         → same for a short vertical clip (YouTube Shorts, website, social media)
 ```
 
 Every completed step writes its ID/URL back to the text file's front matter, so an interrupted
@@ -68,6 +69,14 @@ is enabled with `YOUTUBE_UPLOAD=1`.
 OAuth tokens are stored only on the local machine in `~/.config/kaikuja-publish/tokens.json`
 (file mode 600). Access can be revoked at any time at
 <https://myaccount.google.com/permissions>; deleting that file removes the local copy.
+
+### Website
+
+The `sivusto` step updates [kaikujakaikkeudesta.fi](https://kaikujakaikkeudesta.fi): it runs
+`npm run sync` in the website repository (`KAIKUJA_WEBSITE_DIR`, default `~/src/kaikuja-website`),
+commits the regenerated `data/` and pushes `main`, which the host deploys. It refuses to run if
+the website repository is not on `main` or has unpushed commits, so a publish never ships
+unreviewed code. Placeholder `{sivusto}` in the texts is replaced with the page's URL.
 
 ### Scheduling clips for social media
 

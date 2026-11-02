@@ -6,12 +6,13 @@ Lukee jakson Julkaisu.md-tiedoston (frontmatter + "## avain" -osiot) ja tekee:
   prepare  — Podbean: mp3 + luonnosjakso | WordPress: luonnospostaus + artikkelikuva |
              YouTube: hakee käsin ladatun (yksityisen) videon ja asettaa otsikon,
              kuvauksen, tagit ja thumbnailin
-  publish  — julkaisee Podbeanin, WordPressin ja YouTuben (public) ja postaa
-             Mastodoniin, Blueskyhin, LinkedIniin, Facebook-sivulle, Instagramiin
-             ja Threadsiin; avaa oman Facebook-profiilin jakoikkunan
+  publish  — julkaisee Podbeanin, WordPressin ja YouTuben (public), päivittää
+             sivuston kaikujakaikkeudesta.fi ja postaa Mastodoniin, Blueskyhin,
+             LinkedIniin, Facebook-sivulle, Instagramiin ja Threadsiin; avaa oman
+             Facebook-profiilin jakoikkunan
   clip     — lyhyt pystyvideo (Klippi.md) natiivina videona YouTubeen (Shorts),
-             Instagramiin ja Facebook-sivulle (Reels), Threadsiin, Mastodoniin,
-             Blueskyhin ja LinkedIniin — ei blogiin eikä Podbeaniin
+             sivustolle, Instagramiin ja Facebook-sivulle (Reels), Threadsiin,
+             Mastodoniin, Blueskyhin ja LinkedIniin — ei blogiin eikä Podbeaniin
   publish-scheduled — julkaisee kaikki ajoituksensa erääntyneet klipit
   check    — tarkistaa tunnukset (ei muutoksia)
   auth youtube|linkedin — OAuth-kirjautuminen selaimessa (tallentaa tokenit)
@@ -27,6 +28,11 @@ Usage:
 --schedule: Ajoita klippi myöhemmäksi julkaisuksi (sosiaalisiin medioihin). Aika UTC.
             Käytä publish-scheduled-komentoa tai aseta cron-tehtävä tarkistamaan
             ja julkaisemaan ajoitettuja klippejä.
+
+Sivusto (vaihe "sivusto"): ajaa sivuston repossa (KAIKUJA_WEBSITE_DIR, oletus
+~/src/kaikuja-website) `npm run sync`, commitoi data/-muutokset ja puskee mainiin,
+jolloin Vercel julkaisee. Sync lukee jakson Podbean-syötteestä ja vaultista,
+klipin Klippi.md:stä (vaatii julkisen YouTube-videon).
 
 YouTube-video ladataan rajapinnalla vain, jos YOUTUBE_UPLOAD=1 (vaatii YouTuben
 API-auditoinnin; muuten lataukset lukittyvät yksityisiksi). Ilman sitä skripti
@@ -209,7 +215,7 @@ class Doc:
     def fill(self, text, strict=True):
         """Korvaa {youtube} {podbean} {blogi} {jakso} -paikkamerkit. strict=False jättää puuttuvat ennalleen."""
         for k, fm in (('youtube', 'youtube_url'), ('podbean', 'podbean_url'), ('blogi', 'wp_url'),
-                      ('jakso', 'jakso_url')):
+                      ('jakso', 'jakso_url'), ('sivusto', 'sivusto_url')):
             if '{' + k + '}' in text:
                 url = self.get(fm)
                 if not url:
@@ -608,6 +614,105 @@ def youtube_publish(doc):
           'YouTube publish')
     doc.set('youtube_julkaistu', today())
     log(f'YouTube: julkinen {doc.get("youtube_url")}')
+
+
+# ── Sivusto (kaikujakaikkeudesta.fi) ────────────────────────────────────────
+
+SITE = 'https://kaikujakaikkeudesta.fi'
+
+
+def site_dir():
+    return Path(os.path.expanduser(env('KAIKUJA_WEBSITE_DIR', False) or '~/src/kaikuja-website'))
+
+
+def site_git(*args):
+    r = subprocess.run(['git', '-C', str(site_dir()), *args], capture_output=True, text=True)
+    if r.returncode:
+        raise SystemExit(f'Sivusto: git {" ".join(args)} epäonnistui:\n{r.stderr.strip()}')
+    return r.stdout.strip()
+
+
+def site_ready():
+    """Repo on main-haarassa eikä siinä ole puskemattomia committeja (ettei push vie mukanaan
+    tarkistamatonta koodia). Jäljessä oleva haara päivitetään fast-forwardilla."""
+    if not (site_dir() / 'scripts/sync-episodes.mjs').is_file():
+        raise SystemExit(f'Sivusto: repoa ei löydy ({site_dir()}); aseta KAIKUJA_WEBSITE_DIR')
+    if site_git('rev-parse', '--abbrev-ref', 'HEAD') != 'main':
+        raise SystemExit(f'Sivusto: {site_dir()} ei ole main-haarassa')
+    site_git('fetch', '--quiet', 'origin', 'main')
+    ahead, behind = map(int, site_git('rev-list', '--left-right', '--count', 'HEAD...origin/main').split())
+    if ahead:
+        raise SystemExit(f'Sivusto: repossa on {ahead} puskematonta committia — tarkista ja puske ne ensin')
+    if behind and not DRY:
+        site_git('merge', '--ff-only', '--quiet', 'origin/main')
+
+
+def site_sync():
+    r = subprocess.run(['npm', 'run', '--silent', 'sync'], cwd=site_dir(), capture_output=True, text=True)
+    if r.returncode:
+        raise SystemExit(f'Sivusto: npm run sync epäonnistui:\n{r.stdout}{r.stderr}')
+    return json.loads((site_dir() / 'data/episodes.json').read_text()), \
+        json.loads((site_dir() / 'data/clips.json').read_text())
+
+
+def site_push(message):
+    """Commitoi vain data/-muutokset ja puskee; Vercel julkaisee mainin automaattisesti."""
+    site_git('add', '-A', 'data')
+    if not site_git('status', '--porcelain', '--', 'data'):
+        log('Sivusto: ei muutoksia')
+        return
+    log(indent(site_git('diff', '--cached', '--stat', '--', 'data')))
+    site_git('commit', '--quiet', '-m', message, '--', 'data')
+    site_git('push', '--quiet', 'origin', 'main')
+
+
+def website_episode(doc):
+    if doc.get('sivusto_url'):
+        log(f'Sivusto: jo päivitetty ({doc.get("sivusto_url")})')
+        return
+    n = int(doc.get('jakso'))
+    site_ready()
+    if DRY:
+        log(f'  [dry-run] Sivusto: ajaisi npm run sync (jakso {n} Podbean-syötteestä, Kuvaus.md, '
+            f'YouTube/blogi Julkaisu.md:stä), commitoisi data/:n ja puskisi mainiin')
+        return
+
+    def synced():  # Podbean-syöte päivittyy julkaisun jälkeen pienellä viiveellä
+        eps, _ = site_sync()
+        ep = next((e for e in eps if e['number'] == n), None)
+        if not ep:
+            log(f'Sivusto: jakso {n} ei vielä näy Podbean-syötteessä, odotetaan…')
+        return ep
+    ep = poll(synced, f'Sivusto: jakso {n} Podbean-syötteessä', timeout=600, every=30)
+    site_push(f'Jakso {n}: {ep["guest"]}')
+    doc.set('sivusto_url', f'{SITE}/jaksot/{ep["slug"]}')
+    log(f'Sivusto: {doc.get("sivusto_url")} (näkyy kun Vercel on julkaissut, n. minuutti)')
+
+
+def website_clip(doc):
+    if doc.get('sivusto_url'):
+        log(f'Sivusto: jo päivitetty ({doc.get("sivusto_url")})')
+        return
+    m = re.search(r'(?:youtu\.be/|[?&]v=|/shorts/)([\w-]{11})', doc.get('youtube_url'))
+    vid = doc.get('youtube_id') or (m and m.group(1))
+    if not (vid and doc.get('youtube_julkaistu')):
+        msg = ('Sivusto: klippi tarvitsee julkisen YouTube-videon — aja youtube-vaihe ensin, tai jos Short on '
+               'ladattu käsin, lisää Klippi.md:hen youtube_url ja youtube_julkaistu')
+        if DRY:
+            log(f'  [dry-run] {msg}')
+            return
+        raise SystemExit(msg)
+    site_ready()
+    if DRY:
+        log(f'  [dry-run] Sivusto: ajaisi npm run sync (klippi {vid}), commitoisi data/:n ja puskisi mainiin')
+        return
+    _, clips = site_sync()
+    clip = next((c for c in clips if c['youtubeId'] == vid), None)
+    if not clip:
+        raise SystemExit(f'Sivusto: sync ei löytänyt klippiä {vid} (onko jakso {doc.get("jakso")} jo sivustolla?)')
+    site_push(f'Klippi: {clip["title"]} (jakso {clip["episodeNumber"]})')
+    doc.set('sivusto_url', f'{SITE}/klipit#{clip["slug"]}')
+    log(f'Sivusto: {doc.get("sivusto_url")} (näkyy kun Vercel on julkaissut, n. minuutti)')
 
 
 # ── Mastodon ────────────────────────────────────────────────────────────────
@@ -1011,6 +1116,7 @@ def check_all():
         'fields': 'username', 'access_token': env('FB_PAGE_TOKEN')}), 'Instagram').json()['username'])
     ok('Threads', lambda: '@' + check(requests.get(f'{TH}/me', params={
         'fields': 'username', 'access_token': threads_token()}), 'Threads').json()['username'])
+    ok('Sivusto', lambda: (site_ready(), f'{site_dir()} main, ajan tasalla')[1])
     log(f'  YouTube-lataus rajapinnalla: {"päällä" if env("YOUTUBE_UPLOAD", False) else "pois (käsin ladattu video)"}')
 
 
@@ -1024,11 +1130,12 @@ def today():
 
 PREPARE = {'podbean': podbean_prepare, 'wordpress': wordpress_prepare, 'youtube': youtube_prepare}
 PUBLISH = {'podbean': podbean_publish, 'youtube': youtube_publish, 'wordpress': wordpress_publish,
-           'mastodon': mastodon_post, 'bluesky': bluesky_post, 'linkedin': linkedin_post,
+           'sivusto': website_episode, 'mastodon': mastodon_post, 'bluesky': bluesky_post, 'linkedin': linkedin_post,
            'facebook-sivu': facebook_page_post, 'instagram': instagram_post, 'threads': threads_post,
            'facebook-oma': facebook_own}
-# klipit: ei blogia eikä Podbeania. Instagram ennen Threadsia (Threads käyttää Reelin videota).
-CLIP = {'youtube': youtube_clip, 'instagram': instagram_reel,
+# klipit: ei blogia eikä Podbeania. Sivusto YouTuben jälkeen (upottaa Shortsin), Instagram ennen
+# Threadsia (Threads käyttää Reelin videota).
+CLIP = {'youtube': youtube_clip, 'sivusto': website_clip, 'instagram': instagram_reel,
         'threads': lambda d: threads_post(d, video=True), 'facebook-sivu': facebook_page_reel,
         'mastodon': lambda d: mastodon_post(d, video=True), 'bluesky': lambda d: bluesky_post(d, video=True),
         'linkedin': lambda d: linkedin_post(d, video=True)}
