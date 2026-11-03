@@ -55,7 +55,7 @@ import sys
 import time
 import urllib.parse
 import webbrowser
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -895,7 +895,8 @@ def linkedin_post(doc, video=False):
         log(f'  [dry-run] LinkedIn ({len(text)}/3000), {what}:\n{indent(text)}')
         return
     t = linkedin_token()
-    version = env('LINKEDIN_VERSION', False) or (datetime.now().replace(day=1)).strftime('%Y%m')
+    # kuluvan kuukauden versio ei välttämättä ole vielä voimassa kuun alussa → edellinen kuukausi
+    version = env('LINKEDIN_VERSION', False) or (datetime.now().replace(day=1) - timedelta(days=1)).strftime('%Y%m')
     h = {'Authorization': f'Bearer {t["access_token"]}', 'LinkedIn-Version': version,
          'X-Restli-Protocol-Version': '2.0.0', 'Content-Type': 'application/json'}
     if video:
