@@ -1,0 +1,9 @@
+[Unit]
+Description=Publish scheduled Kaikuja Kaikkeudesta clips (kaikuja-publish publish-scheduled)
+
+[Service]
+Type=oneshot
+StateDirectory=kaikuja-publish
+ExecStart=%h/bin/kaikuja-publish publish-scheduled
+StandardOutput=append:%h/.local/state/kaikuja-publish/scheduled.log
+StandardError=append:%h/.local/state/kaikuja-publish/scheduled.log

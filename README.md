@@ -78,16 +78,27 @@ commits the regenerated `data/` and pushes `main`, which the host deploys. It re
 the website repository is not on `main` or has unpushed commits, so a publish never ships
 unreviewed code. Placeholder `{sivusto}` in the texts is replaced with the page's URL.
 
-### Scheduling clips for social media
+### Scheduling clips
 
-Clips (shorts) can be scheduled for later publication to social media platforms:
+Only clips are scheduled: their social-media reach depends on the time of day, while full
+episodes are published immediately. Times are local time.
 
 ```bash
-kaikuja-publish --schedule "2026-11-05 09:00" clip clips.md
-kaikuja-publish publish-scheduled      # publishes all due clips
+kaikuja-publish --schedule "2026-11-05 09:00" clip Klippi.md   # texts are checked now (dry run)
+kaikuja-publish scheduled                                      # list the queue
+kaikuja-publish unschedule Klippi.md
 ```
 
-Scheduled clips are stored in `~/.config/kaikuja-publish/scheduled.json`. You can run
-`publish-scheduled` manually or via cron to execute scheduled posts at the right time.
+The queue lives in `~/.config/kaikuja-publish/scheduled.json`. A systemd user timer
+(`systemd/` in this repo) runs `kaikuja-publish publish-scheduled` every five minutes; it runs
+every step of a due clip, keeps going if one channel fails, retries failed steps on the next
+runs and gives up after three attempts with a desktop notification. Log:
+`~/.local/state/kaikuja-publish/scheduled.log`.
+
+```bash
+cp systemd/kaikuja-publish-scheduled.* ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now kaikuja-publish-scheduled.timer
+```
 
 Comments and command output in the script are in Finnish, the language of the podcast.

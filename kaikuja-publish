@@ -13,21 +13,23 @@ Lukee jakson Julkaisu.md-tiedoston (frontmatter + "## avain" -osiot) ja tekee:
   clip     — lyhyt pystyvideo (Klippi.md) natiivina videona YouTubeen (Shorts),
              sivustolle, Instagramiin ja Facebook-sivulle (Reels), Threadsiin,
              Mastodoniin, Blueskyhin ja LinkedIniin — ei blogiin eikä Podbeaniin
-  publish-scheduled — julkaisee kaikki ajoituksensa erääntyneet klipit
+  publish-scheduled — julkaisee jonosta klipit, joiden aika on tullut (ajastin ajaa)
+  scheduled / unschedule — ajoitetut klipit / ajoituksen peruminen
   check    — tarkistaa tunnukset (ei muutoksia)
   auth youtube|linkedin — OAuth-kirjautuminen selaimessa (tallentaa tokenit)
 
 Usage:
   kaikuja-publish [--dry-run] [--only podbean,wordpress,...] prepare|publish <Julkaisu.md>
   kaikuja-publish [--dry-run] [--only youtube,instagram,...] clip <Klippi.md>
-  kaikuja-publish [--schedule "YYYY-MM-DD HH:MM"] clip <Klippi.md>
-  kaikuja-publish publish-scheduled
+  kaikuja-publish [--only ...] --schedule "YYYY-MM-DD HH:MM" clip <Klippi.md>
+  kaikuja-publish scheduled | unschedule <Klippi.md> | publish-scheduled
   kaikuja-publish check
   kaikuja-publish auth youtube|linkedin
 
---schedule: Ajoita klippi myöhemmäksi julkaisuksi (sosiaalisiin medioihin). Aika UTC.
-            Käytä publish-scheduled-komentoa tai aseta cron-tehtävä tarkistamaan
-            ja julkaisemaan ajoitettuja klippejä.
+--schedule: klippi (kaikki sen vaiheet, tai --only) julkaistaan annettuna aikana (paikallista
+            aikaa). Tekstit tarkistetaan heti dry-runilla; klippi menee jonoon
+            ~/.config/kaikuja-publish/scheduled.json, ja systemd-ajastin
+            kaikuja-publish-scheduled.timer ajaa publish-scheduled:n 5 min välein.
 
 Sivusto (vaihe "sivusto"): ajaa sivuston repossa (KAIKUJA_WEBSITE_DIR, oletus
 ~/src/kaikuja-website) `npm run sync`, commitoi data/-muutokset ja puskee mainiin,
@@ -35,7 +37,7 @@ jolloin Vercel julkaisee. Sync lukee jakson Podbean-syötteestä ja vaultista,
 klipin Klippi.md:stä (vaatii julkisen YouTube-videon).
 
 YouTube-video ladataan rajapinnalla vain, jos YOUTUBE_UPLOAD=1 (vaatii YouTuben
-API-auditoinnin; muuten lataukset lukittyvät yksityisiksi). Ilman sitä skripti
+API-auditoinnin; muuten lataukset lukittuvat yksityisiksi). Ilman sitä skripti
 käyttää kanavan uusinta käsin ladattua ei-julkista videota.
 
 Tunnukset: ~/bin/.env (ks. bin/kaikuja-publish.md). Tokenit: ~/.config/kaikuja-publish/tokens.json
@@ -63,6 +65,7 @@ import requests
 ENV_FILE = Path(os.environ.get('KAIKUJA_PUBLISH_ENV', Path.home() / 'bin/.env'))
 TOKENS = Path.home() / '.config/kaikuja-publish/tokens.json'
 SCHEDULED = Path.home() / '.config/kaikuja-publish/scheduled.json'
+MAX_TRIES = 3
 REDIRECT_PORT = 8765
 REDIRECT = f'http://localhost:{REDIRECT_PORT}/callback'
 GRAPH = 'https://graph.facebook.com/v21.0'
@@ -97,66 +100,126 @@ def save_tokens(t):
     TOKENS.chmod(0o600)
 
 
+# ── ajoitus ─────────────────────────────────────────────────────────────────
+# Klippi jätetään jonoon (scheduled.json) ja publish-scheduled ajaa sen vaiheet, kun aika on tullut.
+# publish-scheduled:iä ajaa systemd-ajastin viiden minuutin välein (systemd/ repossa).
+
 def load_scheduled():
     return json.loads(SCHEDULED.read_text()) if SCHEDULED.exists() else {}
 
 
 def save_scheduled(s):
     SCHEDULED.parent.mkdir(parents=True, exist_ok=True)
-    SCHEDULED.write_text(json.dumps(s, indent=2, default=str))
+    SCHEDULED.write_text(json.dumps(s, indent=2, ensure_ascii=False))
     SCHEDULED.chmod(0o600)
 
 
-def schedule_clip(doc, scheduled_dt):
-    """Tallenna klippi myöhemmäksi julkaisuksi."""
+def parse_when(s):
+    """'YYYY-MM-DD HH:MM' paikallista aikaa → aikavyöhykkeellinen datetime."""
+    try:
+        when = datetime.strptime(s.strip(), '%Y-%m-%d %H:%M').astimezone()
+    except ValueError:
+        raise SystemExit(f'Väärä aikamuoto: {s}; käytä "YYYY-MM-DD HH:MM" (paikallista aikaa)')
+    if when <= datetime.now().astimezone():
+        raise SystemExit(f'Aika on jo mennyt: {s}')
+    return when
+
+
+def run_steps(doc, steps, only, keep_going=False):
+    """Ajaa vaiheet järjestyksessä. keep_going: virhe ei pysäytä muita vaiheita; palauttaa epäonnistuneet."""
+    failed = []
+    for name, fn in steps.items():
+        if name not in only:
+            continue
+        if not keep_going:
+            fn(doc)
+            continue
+        try:
+            fn(doc)
+        except (SystemExit, Exception) as e:
+            log(f'{name} epäonnistui: {e}')
+            failed.append(name)
+    return failed
+
+
+def schedule_clip(doc, when, only):
+    """Tarkistaa tekstit (dry-run) heti, jotta virheet näkyvät nyt eikä vasta julkaisuhetkellä,
+    ja jättää klipin jonoon."""
+    global DRY
+    dry, DRY = DRY, True
+    try:
+        run_steps(doc, CLIP, only)
+    finally:
+        DRY = dry
+    if DRY:
+        log(f'  [dry-run] ajoittaisi klipin {when:%Y-%m-%d %H:%M}')
+        return
     s = load_scheduled()
-    clip_id = f"{scheduled_dt.isoformat()}_{doc.get('jakso')}_{secrets.token_hex(4)}"
-    s[clip_id] = {
-        'klippi_path': str(doc.path),
-        'scheduled_at': scheduled_dt.isoformat(),
-        'jakso': doc.get('jakso'),
-    }
+    s[str(doc.path.resolve())] = {'at': when.isoformat(), 'only': only}
     save_scheduled(s)
-    log(f'Klippi on ajoitettu {scheduled_dt.isoformat()}')
-    return clip_id
+    doc.set('ajoitettu', f'{when:%Y-%m-%d %H:%M}')
+    log(f'Ajoitettu {when:%Y-%m-%d %H:%M}: {", ".join(only)}')
+    if subprocess.run(['systemctl', '--user', '-q', 'is-active', 'kaikuja-publish-scheduled.timer']).returncode:
+        log('  HUOM: ajastin kaikuja-publish-scheduled.timer ei ole päällä — klippi ei julkaistu itsestään')
 
 
-def publish_scheduled():
-    """Julkaise ajoituksensa erääntyneet klipit."""
+def unschedule(doc):
+    s = load_scheduled()
+    if not s.pop(str(doc.path.resolve()), None):
+        raise SystemExit(f'{doc.path.name} ei ole ajoitettu')
+    save_scheduled(s)
+    doc.set('ajoitettu', '')
+    log(f'Ajoitus peruttu: {doc.path.name}')
+
+
+def list_scheduled():
     s = load_scheduled()
     if not s:
         log('Ei ajoitettuja klippejä.')
-        return
-    now = datetime.now(timezone.utc)
-    to_publish = []
-    remaining = {}
+    for path, job in sorted(s.items(), key=lambda x: x[1]['at']):
+        tries = f', {job["yrityksiä"]} epäonnistunutta yritystä ({", ".join(job["epäonnistui"])})' if job.get('yrityksiä') else ''
+        log(f'{datetime.fromisoformat(job["at"]):%Y-%m-%d %H:%M}  {Path(path).name}  [{", ".join(job["only"])}]{tries}')
 
-    for clip_id, info in s.items():
-        scheduled_dt = datetime.fromisoformat(info['scheduled_at'])
-        if scheduled_dt <= now:
-            to_publish.append((clip_id, info))
+
+def notify(msg):
+    try:
+        env_ = {k: v for k, v in os.environ.items() if k != 'LD_LIBRARY_PATH'}  # esim. AppImagen kirjastot
+        subprocess.run(['notify-send', '-a', 'kaikuja-publish', 'kaikuja-publish', msg], env=env_,
+                       capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def publish_scheduled():
+    """Julkaisee jonon klipit, joiden aika on tullut. Epäonnistuneet vaiheet yritetään uudelleen
+    seuraavalla ajolla (jo tehdyt ohitetaan); MAX_TRIES yrityksen jälkeen klippi poistetaan jonosta."""
+    now = datetime.now().astimezone()
+    for path, job in sorted(load_scheduled().items(), key=lambda x: x[1]['at']):
+        if datetime.fromisoformat(job['at']) > now:
+            continue
+        log(f'── {now:%Y-%m-%d %H:%M} ajoitettu klippi {Path(path).name}')
+        if not Path(path).exists():
+            log('  tiedostoa ei löydy — poistetaan jonosta')
+            failed = None
         else:
-            remaining[clip_id] = info
-
-    if not to_publish:
-        soonest = min(s.items(), key=lambda x: x[1]['scheduled_at'])
-        dt = soonest[1]['scheduled_at']
-        log(f'Seuraava klippi ajoitettu {dt}')
-        return
-
-    for clip_id, info in to_publish:
-        log(f'Julkaistaan ajoitettu klippi {clip_id}…')
-        doc = Doc(info['klippi_path'])
-        only = [s.strip() for s in sys.argv[2:]] if len(sys.argv) > 2 else list(CLIP)
-        for name, fn in CLIP.items():
-            if name in only:
-                fn(doc)
-        log(f'Klippi julkaistu: {clip_id}')
-
-    save_scheduled(remaining)
-    if remaining:
-        soonest = min(remaining.items(), key=lambda x: x[1]['scheduled_at'])
-        log(f'Seuraava ajoitettu klippi {soonest[0]} erääntyi {soonest[1]["scheduled_at"]}')
+            failed = run_steps(Doc(path), CLIP, job['only'], keep_going=True)
+        if DRY:
+            continue
+        s = load_scheduled()  # luetaan uudelleen: ajoitus on voinut muuttua ajon aikana
+        if failed:
+            job['epäonnistui'], job['yrityksiä'] = failed, job.get('yrityksiä', 0) + 1
+            if job['yrityksiä'] < MAX_TRIES:
+                s[path] = job
+                log(f'  yritetään uudelleen: {", ".join(failed)}')
+            else:
+                s.pop(path, None)
+                Doc(path).set('ajoitus_epäonnistui', ', '.join(failed))
+                notify(f'{Path(path).stem}: julkaisu epäonnistui ({", ".join(failed)}) — aja clip käsin')
+        else:
+            s.pop(path, None)
+            if failed is not None:
+                notify(f'{Path(path).stem} julkaistu')
+        save_scheduled(s)
 
 
 def log(msg):
@@ -1147,41 +1210,41 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--dry-run', action='store_true')
     ap.add_argument('--only', help='pilkulla erotettu lista vaiheita')
-    ap.add_argument('--schedule', help='ajoita klippi myöhemmäksi (muoto: YYYY-MM-DD HH:MM)', metavar='AIKA')
-    ap.add_argument('cmd', choices=['prepare', 'publish', 'clip', 'check', 'auth', 'publish-scheduled'])
+    ap.add_argument('--schedule', metavar='"YYYY-MM-DD HH:MM"',
+                    help='clip: julkaise myöhemmin (paikallista aikaa); ks. publish-scheduled')
+    ap.add_argument('cmd', choices=['prepare', 'publish', 'clip', 'check', 'auth',
+                                    'publish-scheduled', 'scheduled', 'unschedule'])
     ap.add_argument('arg', nargs='?')
     a = ap.parse_args()
     DRY = a.dry_run
     load_env()
+    if a.schedule and a.cmd != 'clip':
+        raise SystemExit('--schedule toimii vain clip-komennon kanssa (jaksot julkaistaan heti)')
     if a.cmd == 'check':
         return check_all()
     if a.cmd == 'auth':
         return {'youtube': auth_youtube, 'linkedin': auth_linkedin}[a.arg]()
     if a.cmd == 'publish-scheduled':
         return publish_scheduled()
+    if a.cmd == 'scheduled':
+        return list_scheduled()
     doc = Doc(a.arg)
+    if a.cmd == 'unschedule':
+        return unschedule(doc)
     steps = {'prepare': PREPARE, 'publish': PUBLISH, 'clip': CLIP}[a.cmd]
+    when = parse_when(a.schedule) if a.schedule else None
     if a.cmd == 'clip':
         w, h, dur = video_info(doc.file('video'))
         log(f'Klippi: {doc.get("video")} — {w}×{h}, {dur:.0f} s, {mb(doc.file("video"))}')
         if h <= w or dur > 180:
             log('  HUOM: YouTube Shorts vaatii pystyvideon ja enintään 3 min (muuten tavallinen video)')
-        if a.schedule:
-            try:
-                scheduled_dt = datetime.fromisoformat(a.schedule.replace(' ', 'T'))
-                if scheduled_dt <= datetime.now():
-                    raise SystemExit(f'Aika on jo mennyt: {a.schedule}')
-                schedule_clip(doc, scheduled_dt)
-                return
-            except ValueError:
-                raise SystemExit(f'Väärä aikamuoto: {a.schedule}; käytä YYYY-MM-DD HH:MM')
     only = [s.strip() for s in a.only.split(',')] if a.only else list(steps)
     for name in only:
         if name not in steps:
             raise SystemExit(f'Tuntematon vaihe {name}; vaihtoehdot: {", ".join(steps)}')
-    for name, fn in steps.items():
-        if name in only:
-            fn(doc)
+    if when:
+        return schedule_clip(doc, when, only)
+    run_steps(doc, steps, only)
 
 
 if __name__ == '__main__':
