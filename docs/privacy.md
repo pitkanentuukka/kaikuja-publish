@@ -39,8 +39,11 @@ viewing history.
 - Video IDs and URLs returned by YouTube are written into the owner's own episode text
   file, so the tool knows which steps are already done.
 - Nothing is sent anywhere except to the APIs of the services the owner publishes to
-  (YouTube, Podbean, WordPress, Mastodon, Bluesky, LinkedIn, Meta). No data is sold,
-  shared with third parties, or used for advertising.
+  (YouTube, Podbean, WordPress, Mastodon, Bluesky, LinkedIn, Meta). The one exception:
+  Instagram and Threads fetch videos from a public URL, so the owner's own clip video
+  file is uploaded to litterbox.catbox.moe, which deletes it after one hour. No YouTube
+  data is ever sent there. No data is sold, shared with third parties, or used for
+  advertising.
 - The tool does not use cookies or any tracking.
 
 ## Revoking access and deleting data

@@ -999,7 +999,7 @@ def facebook_page_post(doc):
 
 
 def rupload(url, tok, path):
-    """Metan resumable-lataus (Facebook Reels, Instagram): koko tiedosto kerralla."""
+    """Metan resumable-lataus (Facebook Reels): koko tiedosto kerralla."""
     with open(path, 'rb') as f:
         return check(requests.post(url, data=f, headers={
             'Authorization': f'OAuth {tok}', 'offset': '0', 'file_size': str(path.stat().st_size)}),
@@ -1086,20 +1086,33 @@ def instagram_reel(doc):
     if DRY:
         log(f'  [dry-run] Instagram ({len(text)}/2200), Reel {path.name}:\n{indent(text)}')
         return
-    tok = env('FB_PAGE_TOKEN')
+    # Resumable-lataus (rupload) kaatuu sivutokenilla aina (HTTP 500 ProcessingFailedError), ja
+    # Facebook-Reelin fbcdn-osoite antaa virheen 2207076, joten Instagram hakee videon väliaikaisesta
+    # julkisesta osoitteesta.
+    log(f'Instagram: ladataan {path.name} ({mb(path)}) väliaikaiseen julkiseen osoitteeseen…')
     c = check(requests.post(f'{GRAPH}/{env("IG_USER_ID")}/media', data={
-        'media_type': 'REELS', 'upload_type': 'resumable', 'caption': text, 'share_to_feed': 'true',
-        'access_token': tok}), 'Instagram container').json()
-    log(f'Instagram: ladataan {path.name} ({mb(path)})…')
-    rupload(c.get('uri') or f'https://rupload.facebook.com/ig-api-upload/v21.0/{c["id"]}', tok, path)
+        'media_type': 'REELS', 'video_url': temp_public_url(path), 'caption': text, 'share_to_feed': 'true',
+        'access_token': env('FB_PAGE_TOKEN')}), 'Instagram container').json()
     ig_publish(doc, c['id'])
+
+
+def temp_public_url(path):
+    """Lataa tiedoston litterbox.catbox.moe:hen (poistuu tunnin päästä) ja palauttaa sen URLin."""
+    with open(path, 'rb') as f:
+        url = check(requests.post('https://litterbox.catbox.moe/resources/internals/api.php',
+                                  data={'reqtype': 'fileupload', 'time': '1h'},
+                                  files={'fileToUpload': (path.name, f, 'video/mp4')}),
+                    'Litterbox upload').text.strip()
+    if not url.startswith('https://'):
+        raise SystemExit(f'Litterbox upload epäonnistui: {url[:200]}')
+    return url
 
 
 # ── Threads ─────────────────────────────────────────────────────────────────
 
 def threads_post(doc, video=False):
     """Jakso: teksti + linkkikortti. Klippi: video — Threads hakee videon julkisesta URLista, joten
-    käytetään juuri julkaistun Instagram-Reelin media_url:ia (instagram-vaihe ensin)."""
+    video ladataan väliaikaiseen julkiseen osoitteeseen (Instagram-Reelin media_url antaa ERROR UNKNOWN)."""
     if doc.get('threads_url'):
         log(f'Threads: jo postattu ({doc.get("threads_url")})')
         return
@@ -1107,16 +1120,14 @@ def threads_post(doc, video=False):
     if len(text) > 500:
         raise SystemExit(f'Threads-teksti liian pitkä ({len(text)} > 500)')
     if DRY:
-        what = 'video (Instagram-Reelistä)' if video else f'linkki {doc.fill(doc.get("linkkikortti", "{blogi}"))}'
+        what = f'video {doc.file("video").name}' if video else f'linkki {doc.fill(doc.get("linkkikortti", "{blogi}"))}'
         log(f'  [dry-run] Threads ({len(text)}/500), {what}:\n{indent(text)}')
         return
     uid, tok = env('THREADS_USER_ID'), threads_token()
     data = {'text': text, 'access_token': tok}
     if video:
-        if not doc.get('instagram_id'):
-            raise SystemExit('Threads-video tarvitsee Instagram-Reelin (aja instagram-vaihe ensin)')
-        data.update(media_type='VIDEO', video_url=check(requests.get(f'{GRAPH}/{doc.get("instagram_id")}', params={
-            'fields': 'media_url', 'access_token': env('FB_PAGE_TOKEN')}), 'Instagram media_url').json()['media_url'])
+        log(f'Threads: ladataan {doc.file("video").name} väliaikaiseen julkiseen osoitteeseen…')
+        data.update(media_type='VIDEO', video_url=temp_public_url(doc.file('video')))
     else:
         data.update(media_type='TEXT', link_attachment=doc.fill(doc.get('linkkikortti', '{blogi}')))
     cid = check(requests.post(f'{TH}/{uid}/threads', data=data), 'Threads container').json()['id']
