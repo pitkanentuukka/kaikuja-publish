@@ -52,6 +52,7 @@ import mimetypes
 import os
 import re
 import secrets
+import socket
 import subprocess
 import sys
 import time
@@ -66,6 +67,7 @@ ENV_FILE = Path(os.environ.get('KAIKUJA_PUBLISH_ENV', Path.home() / 'bin/.env'))
 TOKENS = Path.home() / '.config/kaikuja-publish/tokens.json'
 SCHEDULED = Path.home() / '.config/kaikuja-publish/scheduled.json'
 MAX_TRIES = 3
+MAX_LATE = timedelta(hours=24)  # verkkovirheitä yritetään uudelleen korkeintaan näin kauan ajoitusajan jälkeen
 REDIRECT_PORT = 8765
 REDIRECT = f'http://localhost:{REDIRECT_PORT}/callback'
 GRAPH = 'https://graph.facebook.com/v21.0'
@@ -125,9 +127,29 @@ def parse_when(s):
     return when
 
 
+NETWORK_ERRORS = re.compile(r'Could not resolve host|name resolution|Name or service not known|'
+                            r'Network is unreachable|Failed to connect|Connection timed out|Connection refused')
+
+
+def is_network_error(e):
+    return isinstance(e, (requests.ConnectionError, requests.Timeout)) or bool(NETWORK_ERRORS.search(str(e)))
+
+
+def online():
+    """Onko verkkoyhteys? Riittää, että yksikin palvelu vastaa."""
+    for host in ('graph.facebook.com', 'bsky.social', 'github.com'):
+        try:
+            socket.create_connection((host, 443), timeout=5).close()
+            return True
+        except OSError:
+            pass
+    return False
+
+
 def run_steps(doc, steps, only, keep_going=False):
-    """Ajaa vaiheet järjestyksessä. keep_going: virhe ei pysäytä muita vaiheita; palauttaa epäonnistuneet."""
-    failed = []
+    """Ajaa vaiheet järjestyksessä. keep_going: virhe ei pysäytä muita vaiheita; palauttaa
+    epäonnistuneet ja niistä ne, jotka kaatuivat verkkovirheeseen."""
+    failed, network = [], []
     for name, fn in steps.items():
         if name not in only:
             continue
@@ -139,7 +161,9 @@ def run_steps(doc, steps, only, keep_going=False):
         except (SystemExit, Exception) as e:
             log(f'{name} epäonnistui: {e}')
             failed.append(name)
-    return failed
+            if is_network_error(e):
+                network.append(name)
+    return failed, network
 
 
 def schedule_clip(doc, when, only):
@@ -158,6 +182,8 @@ def schedule_clip(doc, when, only):
     s[str(doc.path.resolve())] = {'at': when.isoformat(), 'only': only}
     save_scheduled(s)
     doc.set('ajoitettu', f'{when:%Y-%m-%d %H:%M}')
+    if doc.get('ajoitus_epäonnistui'):
+        doc.set('ajoitus_epäonnistui', '')
     log(f'Ajoitettu {when:%Y-%m-%d %H:%M}: {", ".join(only)}')
     if subprocess.run(['systemctl', '--user', '-q', 'is-active', 'kaikuja-publish-scheduled.timer']).returncode:
         log('  HUOM: ajastin kaikuja-publish-scheduled.timer ei ole päällä — klippi ei julkaistu itsestään')
@@ -192,23 +218,34 @@ def notify(msg):
 
 def publish_scheduled():
     """Julkaisee jonon klipit, joiden aika on tullut. Epäonnistuneet vaiheet yritetään uudelleen
-    seuraavalla ajolla (jo tehdyt ohitetaan); MAX_TRIES yrityksen jälkeen klippi poistetaan jonosta."""
+    seuraavalla ajolla (jo tehdyt ohitetaan); MAX_TRIES yrityksen jälkeen klippi poistetaan jonosta.
+    Verkkovirheet eivät kuluta yrityksiä: ilman verkkoa ei yritetä lainkaan, ja verkkovirheeseen
+    kaatuneita vaiheita yritetään uudelleen MAX_LATE ajan ajoitusajasta."""
     now = datetime.now().astimezone()
-    for path, job in sorted(load_scheduled().items(), key=lambda x: x[1]['at']):
-        if datetime.fromisoformat(job['at']) > now:
-            continue
+    due = [(p, j) for p, j in sorted(load_scheduled().items(), key=lambda x: x[1]['at'])
+           if datetime.fromisoformat(j['at']) <= now]
+    if due and not online():
+        log(f'── {now:%Y-%m-%d %H:%M} ei verkkoyhteyttä — {len(due)} erääntynyttä klippiä odottaa seuraavaa ajoa')
+        return
+    for path, job in due:
         log(f'── {now:%Y-%m-%d %H:%M} ajoitettu klippi {Path(path).name}')
         if not Path(path).exists():
             log('  tiedostoa ei löydy — poistetaan jonosta')
-            failed = None
+            failed = network = None
         else:
-            failed = run_steps(Doc(path), CLIP, job['only'], keep_going=True)
+            failed, network = run_steps(Doc(path), CLIP, job['only'], keep_going=True)
         if DRY:
             continue
         s = load_scheduled()  # luetaan uudelleen: ajoitus on voinut muuttua ajon aikana
         if failed:
-            job['epäonnistui'], job['yrityksiä'] = failed, job.get('yrityksiä', 0) + 1
-            if job['yrityksiä'] < MAX_TRIES:
+            only_network = set(failed) == set(network)
+            if not only_network:
+                job['yrityksiä'] = job.get('yrityksiä', 0) + 1
+            job['epäonnistui'] = failed
+            late = now - datetime.fromisoformat(job['at'])
+            if job.get('yrityksiä', 0) < MAX_TRIES and late < MAX_LATE:
+                if only_network:
+                    log('  verkkovirhe — ei kuluta yrityksiä')
                 s[path] = job
                 log(f'  yritetään uudelleen: {", ".join(failed)}')
             else:

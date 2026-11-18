@@ -92,7 +92,9 @@ kaikuja-publish unschedule Klippi.md
 The queue lives in `~/.config/kaikuja-publish/scheduled.json`. A systemd user timer
 (`systemd/` in this repo) runs `kaikuja-publish publish-scheduled` every five minutes; it runs
 every step of a due clip, keeps going if one channel fails, retries failed steps on the next
-runs and gives up after three attempts with a desktop notification. Log:
+runs and gives up after three attempts with a desktop notification. Network outages don't use
+up attempts: while offline nothing is tried, and steps that fail with a network error are retried
+for up to 24 hours after the scheduled time. Log:
 `~/.local/state/kaikuja-publish/scheduled.log`.
 
 ```bash
